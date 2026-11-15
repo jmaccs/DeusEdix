@@ -121,7 +121,7 @@ program that DeusEdix starts, like the Windows one.
    It is the existing `UCMapKitHost.cpp`, which is portable apart from its job object and its
    `LoadLibraryExW`; both have POSIX equivalents. **DONE.**
 3. **The bridge**: the same `UCBridgeApi`, implemented against OpenDE instead of `Editor.dll`.
-   Most of it is the dump functions.
+   Most of it is the dump functions. **DONE** — `mapkit/host/openbridge/`.
 4. **The Python layer**: the host's name and extension, `creationflags`, the process handle used
    by the CPU preference, the Windows process and window control in `mapkit/game_process.py`, and
    the launcher, which on macOS can open the page in the browser instead of a WebView2 window.
@@ -130,6 +130,25 @@ program that DeusEdix starts, like the Windows one.
 
 Every bridge function is checked against the Windows bridge running under Wine, comparing the
 files they write byte for byte.
+
+### The bridge, on OpenDE
+
+`mapkit/host/openbridge/` is a second bridge, with the same `UCBridgeApi`, that runs OpenDE's
+engine in the host's process. It never opens a window and never starts a renderer: it uses the
+engine's own packages, brush builder, BSP builder, lightmap builder, path builder and map writer
+directly. The UnrealEd command lines the editor sends are understood, so `MAP LOAD`, `MAP REBUILD`,
+`LIGHT APPLY`, `PATHS DEFINE`, `MAP SAVE` and the rest work as they do on Windows.
+
+All forty-seven functions are implemented. On a map of the game the numbers are the editor's own:
+the same actors, the same brushes, nodes, surfaces and zones, the same lights, and a map saved
+and loaded again gives back the same geometry, byte for byte.
+
+Two are not exactly what the SDK bridge does, and neither is faked:
+
+- `meshImport` ignores the old vertex format argument (OpenDE's importer reads Deus Ex's own
+  format only), and OpenDE's picture importer does not turn a picture the right way up.
+- `texFlags` derives the flags from the texture's booleans, as OpenDE's renderer does, because
+  Deus Ex textures have no flags of their own.
 
 ### The host, ported
 
