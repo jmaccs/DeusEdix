@@ -1,14 +1,14 @@
 // UCMapKitHost: the headless host of the map editor. It reads commands (a file, or stdin in a session), hands each
 // one to an engine bridge (bridge.h; UCEngineBridge.dll runs Deus Ex's own engine) and writes what the bridge gives
 // back: its answers on stdout, its rows in files. No engine header here: standard C++ (README.md).
-#include <windows.h>
+// The system's own calls (files, paths, the clock, dlopen, signals) are in platform.h: Windows, macOS and Linux.
+#include "platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <float.h>
 #include <string>
 #include <vector>
-#include "nlohmann/json.hpp"
+#include "third_party/nlohmann/json.hpp"
 #include "bridge.h"
 
 typedef nlohmann::json Json;
@@ -28,17 +28,10 @@ static void error(const char* line) {
     fflush(stderr);
 }
 
-// UTF-8 as the file system's UTF-16 (a path may have any letter)
-static std::wstring wide(const char* text) {
-    int size = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    std::wstring out(size > 1 ? size - 1 : 0, L'\0');
-    if (size > 1) MultiByteToWideChar(CP_UTF8, 0, text, -1, &out[0], size);
-    return out;
-}
-
+// UTF-8 as the file system's own letters (a path may have any letter): pathOf() in platform.h
 struct UCFile { FILE* file; };
 static UCFile* openFile(const char* path, int append) {
-    FILE* f = _wfopen(wide(path).c_str(), append ? L"ab" : L"wb");
+    FILE* f = hostOpen(pathOf(path), append ? "ab" : "wb");
     if (!f) return NULL;
     UCFile* file = new UCFile;
     file->file = f;
@@ -58,7 +51,7 @@ static void closeFile(UCFile* file) {
 static const UCHostApi Host = { print, error, openFile, writeRow, writeBytes, closeFile };
 
 static bool readFile(const char* path, std::string& out) {
-    FILE* f = _wfopen(wide(path).c_str(), L"rb");
+    FILE* f = hostOpen(pathOf(path), "rb");
     if (!f) return false;
     char chunk[65536];
     size_t got;
@@ -93,7 +86,7 @@ public:
         const char* text = (*this)[i];
         char* end;
         out = (float)strtod(text, &end);
-        return *text && !*end && _finite(out);
+        return *text && !*end && hostFinite(out);
     }
     bool number(size_t i, int& out) const {
         const char* text = (*this)[i];
@@ -271,17 +264,24 @@ static const struct { const char* name; Command run; } Commands[] = {
 // UC_PREVIEW: export the just-built level while its packages are still loaded.
 // Optional derived data only. The caller creates Preview/Output/tex beforehand;
 // no map is saved or modified by this command. A completion marker is written last.
+#ifdef _WIN32
+static const char PreviewRoot[] = "..\\Preview\\Output\\";
+static const char PreviewSlash = '\\';
+#else
+static const char PreviewRoot[] = "../Preview/Output/";
+static const char PreviewSlash = '/';
+#endif
 static int previewBundle() {
-    const std::string root = "..\\Preview\\Output\\";
+    const std::string root = PreviewRoot;
     std::string file, marker = root + "complete.json";
-    DeleteFileW(wide(marker.c_str()).c_str());
+    hostRemove(pathOf(marker.c_str()));
     try {
         if (!Bridge->bspDump((root + "bsp.bin").c_str()) ||
             !Bridge->brushes((root + "brushes.jsonl").c_str()) ||
             !Bridge->meshes((root + "meshes.bin").c_str()) ||
             !Bridge->lightDump((root + "lights.bin").c_str()) ||
             !Bridge->paths((root + "paths.jsonl").c_str()) ||
-            !Bridge->exec("MAP EXPORT FILE=\"..\\Preview\\Output\\scene.t3d\"")) {
+            !Bridge->exec((std::string("MAP EXPORT FILE=\"") + root + "scene.t3d\"").c_str())) {
             print("UCMapKit|preview|unavailable");
             return 1;
         }
@@ -296,13 +296,12 @@ static int previewBundle() {
                 if (tex.find_first_of("\r\n\" \t") != std::string::npos)
                     throw std::runtime_error("unsupported texture name");
                 std::string base = std::to_string(textures.size());
-                std::string bmp = root + "tex\\" + base + ".bmp";
+                std::string bmp = root + "tex" + PreviewSlash + base + ".bmp";
                 std::string cmd = "OBJ EXPORT TYPE=Texture NAME=" + tex + " FILE=\"" + bmp + "\"";
                 Bridge->exec(cmd.c_str());
-                WIN32_FILE_ATTRIBUTE_DATA info = {};
-                if (!GetFileAttributesExW(wide(bmp.c_str()).c_str(), GetFileExInfoStandard, &info)
-                    || (!info.nFileSizeHigh && !info.nFileSizeLow))
-                    Bridge->texDump(tex.c_str(), (root + "tex\\" + base + ".raw").c_str(), 256);
+                unsigned long long size = 0;
+                if (!hostFileSize(pathOf(bmp.c_str()), size) || !size)
+                    Bridge->texDump(tex.c_str(), (root + "tex" + PreviewSlash + base + ".raw").c_str(), 256);
                 textures[tex] = base;
             }
         }
@@ -316,7 +315,7 @@ static int previewBundle() {
         closeFile(out);
         print("UCMapKit|preview|ready");
     } catch (const std::exception&) {
-        DeleteFileW(wide(marker.c_str()).c_str());
+        hostRemove(pathOf(marker.c_str()));
         print("UCMapKit|preview|unavailable");
     }
     return 1;
@@ -332,6 +331,7 @@ static int runCommand(const char* line) {
 
 // A crash in the engine fails its command, not the session.
 static int guardedCommand(const char* line) {
+#ifdef _WIN32
     __try {
         return runCommand(line);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -339,9 +339,19 @@ static int guardedCommand(const char* line) {
         fflush(stdout);
         return 0;
     }
+#else
+    // The signal handler of platform.h reports the fault and comes back here (see "a crash in a command").
+    UCHostFaultThread = pthread_self();
+    if (sigsetjmp(UCHostFaultJump, 1) != 0) { UCHostFaultArmed = 0; return 0; }
+    UCHostFaultArmed = 1;
+    int result = runCommand(line);
+    UCHostFaultArmed = 0;
+    return result;
+#endif
 }
 
 // ---------------------------------------------------------------- the session
+#ifdef _WIN32
 // First-chance access violations on any thread: module + offset in the log (diagnostics).
 static LONG CALLBACK reportFault(PEXCEPTION_POINTERS info) {
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
@@ -358,11 +368,13 @@ static LONG CALLBACK reportFault(PEXCEPTION_POINTERS info) {
     fflush(stdout);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+#endif /* _WIN32: fault reporting */
 
 // The host and its engine run in a job of their own: no other process can be started from it, it cannot reach the
 // clipboard, the display settings or other desktops, and a crash ends it instead of waiting on an error dialog. A
 // map or package made to attack the 2000s engine code that reads it gets that much less to work with (README.md).
 static void isolate() {
+#ifdef _WIN32
     HANDLE job = CreateJobObjectW(NULL, NULL);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
@@ -375,21 +387,48 @@ static void isolate() {
         || !AssignProcessToJobObject(job, GetCurrentProcess()))
         printf("UCMapKit|isolation|failed|%lu\n", GetLastError());
     // the job's handle stays open: the job ends with the process
+#else
+    // The same, as far as POSIX goes, and best effort: what a system does not have is left out, never a failure
+    // of the host. Only a facility that is there and refuses is reported.
+    int failed = 0;
+    // A session of its own: no controlling terminal, so nothing in the engine can open /dev/tty and ask a question.
+    // EPERM: the process is already the leader of its group, which is what this wants anyway.
+    if (setsid() < 0 && errno != EPERM) failed = errno;
+    // No core files: a crash of an engine with a whole map in it would fill the disk.
+    struct rlimit limit;
+    limit.rlim_cur = 0;
+    limit.rlim_max = 0;
+    if (!failed && setrlimit(RLIMIT_CORE, &limit) != 0) failed = errno;
+#if defined(__APPLE__)
+    // One process: fork() and posix_spawn() then fail. macOS counts processes in RLIMIT_NPROC, not threads, so a
+    // bridge can still have its own. The hard limit stays: the server that starts the host can still raise it.
+    if (!failed && getrlimit(RLIMIT_NPROC, &limit) == 0 && limit.rlim_cur > 1) {
+        limit.rlim_cur = 1;
+        if (setrlimit(RLIMIT_NPROC, &limit) != 0) failed = errno;
+    }
+#elif defined(__linux__)
+    // Not RLIMIT_NPROC: Linux counts threads in it, and that would turn the first thread of an engine bridge into a
+    // failure. These two are the confinement Linux gives without that cost.
+#ifdef PR_SET_PDEATHSIG
+    if (!failed && prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) failed = errno;   // ends with its parent
+#endif
+#ifdef PR_SET_NO_NEW_PRIVS
+    if (!failed && prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) failed = errno;      // gains no privilege
+#endif
+#endif
+    if (failed) printf("UCMapKit|isolation|failed|%d\n", failed);
+#endif
 }
 
 // The engine bridge: by default UCEngineBridge.dll next to the host (loaded by its full path, never searched for)
-static bool loadBridge(const std::wstring& path) {
-    HMODULE dll = LoadLibraryExW(path.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    UCBridgeEntry entry = dll ? (UCBridgeEntry)GetProcAddress(dll, UC_BRIDGE_ENTRY) : NULL;
+static bool loadBridge(const HostPath& path) {
+    void* library = hostOpenLibrary(path);
+    UCBridgeEntry entry = library ? (UCBridgeEntry)hostLibrarySymbol(library, UC_BRIDGE_ENTRY) : NULL;
     Bridge = entry ? entry(UC_BRIDGE_VERSION) : NULL;
+#ifndef _WIN32
+    hostModulesScan();                      // the bridge is an image the fault report can name now
+#endif
     return Bridge != NULL;
-}
-static std::wstring besideHost(const wchar_t* name) {
-    std::vector<wchar_t> path(MAX_PATH);
-    DWORD n;
-    while ((n = GetModuleFileNameW(NULL, &path[0], (DWORD)path.size())) == path.size()) path.resize(path.size() * 2);
-    std::wstring exe(&path[0], n);
-    return exe.substr(0, exe.find_last_of(L'\\') + 1) + name;
 }
 
 // One command a line, of any length.
@@ -409,12 +448,16 @@ static bool readLine(FILE* input, std::string& line) {
 
 // UCMapKitHost [--bridge <dll>] <command file | - | --wait-batch | --make [ini]>
 int main(int argc, char** argv) {
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, reportFault);
+#else
+    hostFaultInstall();
+#endif
     isolate();
     int first = 1;
-    std::wstring bridge = besideHost(L"UCEngineBridge.dll");
+    HostPath bridge = besideHost(UC_BRIDGE_FILE);
     if (argc >= 3 && !strcmp(argv[1], "--bridge")) {
-        bridge = wide(argv[2]);
+        bridge = pathOf(argv[2]);
         first = 3;
     }
     if (!loadBridge(bridge)) {
@@ -436,7 +479,7 @@ int main(int argc, char** argv) {
     // while a long batch runs. File-mode errors still terminate immediately.
     int resident = !strcmp(argv[first], "--build-worker");
     int batchStdin = !strcmp(argv[first], "--wait-batch");
-    FILE* input = (interactive || batchStdin || resident) ? stdin : _wfopen(wide(argv[first]).c_str(), L"rt");
+    FILE* input = (interactive || batchStdin || resident) ? stdin : hostOpen(pathOf(argv[first]), "rt");
     if (!input) return 3;
     if (!Bridge->start(&Host)) return 2;
     puts("UCMapKit|ready"); fflush(stdout);
@@ -444,7 +487,7 @@ int main(int argc, char** argv) {
     if (batchStdin) {
         std::string batch;
         if (!readLine(stdin, batch)) return 3;
-        input = _wfopen(wide(batch.c_str()).c_str(), L"rt");
+        input = hostOpen(pathOf(batch.c_str()), "rt");
         if (!input) return 3;
     }
     std::string line;
@@ -452,7 +495,7 @@ int main(int argc, char** argv) {
         if (line.empty() || line[0] == '#') { if (interactive) { puts("UCMapKit|ready"); fflush(stdout); } continue; }
         if (interactive && line == "UC_QUIT") break;
         printf("UCMapKit|command|%s\n", line.c_str()); fflush(stdout);
-        DWORD start = GetTickCount();
+        HostTick start = hostTicks();
         int success = guardedCommand(line.c_str());
         if (!success) {
             if (!interactive) {
@@ -463,7 +506,7 @@ int main(int argc, char** argv) {
         }
         int actors = Bridge->actorCount();
         if (actors >= 0) printf("UCMapKit|actors|%d\n", actors);
-        printf("UCMapKit|complete|%lu ms\n", GetTickCount() - start);
+        printf("UCMapKit|complete|" UC_TICK_FMT " ms\n", hostTicks() - start);
         if (interactive) puts("UCMapKit|ready");
         fflush(stdout);
     }

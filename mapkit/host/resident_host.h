@@ -12,8 +12,8 @@ static int residentHost() {
         const std::string folder=value["folder"],batch=value["batch"],id=value["id"];
         if(id.size()!=32||id.find_first_not_of("0123456789abcdef")!=std::string::npos)return 5;
         if(used&&!guardedCommand("UC_BUILD_RESET"))return 5;
-        if(!SetCurrentDirectoryW(wide(folder.c_str()).c_str()))return 5;
-        FILE* input=_wfopen(wide(batch.c_str()).c_str(),L"rt");
+        if(!hostChangeDirectory(pathOf(folder.c_str())))return 5;
+        FILE* input=hostOpen(pathOf(batch.c_str()),"rt");
         if(!input)return 3;
         std::string line;
         bool first=true;
@@ -22,13 +22,13 @@ static int residentHost() {
             if(first&&line!="MAP NEW"){fclose(input);return 5;}
             first=false;
             printf("UCMapKit|command|%s\n",line.c_str());fflush(stdout);
-            DWORD at=GetTickCount();
+            HostTick at=hostTicks();
             if(!guardedCommand(line.c_str())) {
                 printf("UCMapKit|failed|%s\n",line.c_str());fflush(stdout);
                 fclose(input);return 4;
             }
             printf("UCMapKit|actors|%d\n",Bridge->actorCount());
-            printf("UCMapKit|complete|%lu ms\n",GetTickCount()-at);fflush(stdout);
+            printf("UCMapKit|complete|" UC_TICK_FMT " ms\n",hostTicks()-at);fflush(stdout);
         }
         fclose(input);
         if(first)return 5;
