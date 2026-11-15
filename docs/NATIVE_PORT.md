@@ -116,10 +116,10 @@ program that DeusEdix starts, like the Windows one.
 
 ## The work
 
-1. **Fix the two compiler bugs** in OpenDE. Small, and they unblock everything else.
+1. **Fix the two compiler bugs** in OpenDE. Small, and they unblock everything else. **DONE.**
 2. **The host**: a program that reads commands on stdin and answers in the protocol's format.
    It is the existing `UCMapKitHost.cpp`, which is portable apart from its job object and its
-   `LoadLibraryExW`; both have POSIX equivalents.
+   `LoadLibraryExW`; both have POSIX equivalents. **DONE.**
 3. **The bridge**: the same `UCBridgeApi`, implemented against OpenDE instead of `Editor.dll`.
    Most of it is the dump functions.
 4. **The Python layer**: the host's name and extension, `creationflags`, the process handle used
@@ -130,3 +130,41 @@ program that DeusEdix starts, like the Windows one.
 
 Every bridge function is checked against the Windows bridge running under Wine, comparing the
 files they write byte for byte.
+
+### The host, ported
+
+`mapkit/host/UCMapKitHost.cpp` was Windows-only: the bridge was a DLL loaded with
+`LoadLibraryExW`, a crash in the engine was caught with SEH, the process was put in a job object,
+and the paths and the clock came from `windows.h`. All of it is in `mapkit/host/platform.h` now,
+with the Windows calls behind `_WIN32` unchanged.
+
+On POSIX the bridge is a shared library opened with `dlopen`, a crash is caught with a signal
+handler that reports the faulting image and offset (`UCMapKit|av|<module>+0x<offset>|read 0x...`,
+the same shape as Windows) and lets the session go on, and the process is put in a session of its
+own with `setsid` and its limits set.
+
+The protocol, the command modes, the exit codes and `bridge.h` are unchanged, so the editor does
+not change.
+
+Two things are not a faithful port, and cannot be:
+
+- The Windows handler reports *every* first-chance access violation, including the ones the engine
+  swallows; POSIX has no such thing as a first-chance signal, so only the fatal fault is reported.
+  `UCMapKit|fault|0x...` carries the signal number instead of an NTSTATUS.
+- The clipboard, desktop and display restrictions of the Windows job have no equivalent without a
+  graphical system. The process limits that do exist are set instead.
+
+### The runtime package, and the original game
+
+DeusEdix's runtime is written for Deus Ex: *Revision*, and a few of its classes use what only
+Revision has. `runtime/vanilla/Classes` already holds the versions for the original game, made
+from the Revision ones by `dev/vanilla_runtime.py`, and they are the ones to use: with them the
+whole package of 87 classes compiles against the original 1112f build.
+
+Two more things were needed for that, both in OpenDE's compiler:
+
+- The packages the ini lists are loaded before compiling, not a fixed handful: a script naming a
+  class of `DeusExUI` (the fonts) failed with "Can't find Font" otherwise.
+- `DeusEdixNav` (the native DLL the game loads) is a package of its own, and its class has to be
+  there before `UCNavMesh` can name it.
+
