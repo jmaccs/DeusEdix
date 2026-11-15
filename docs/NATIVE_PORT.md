@@ -79,6 +79,32 @@ Together they stop DeusEdix's `runtime/DeusEdix` package (87 classes) from compi
 A third, separate matter is that some of those classes use `AttemptPickup`, which is a Deus Ex:
 *Revision* function and is not in the original 1112f build.
 
+### What Phase 1 found
+
+Both bugs are fixed in OpenDE (`jmaccs/OpenDE`, branch `feature/native-arm64-bridge`):
+
+- `ucc make` now loads the game's packages, with every export instantiated, before compiling.
+  A package that is about to be built from its sources is left out, so it is still built.
+- A class named before its own script is parsed no longer leaves a broken placeholder. The
+  placeholder no longer points back at the class that named it, the class is fully reset when
+  its own script arrives, and a class that is never defined is reported as an unrecognized type
+  instead of crashing the compiler.
+
+With those, DeusEdix's runtime package compiles against the original 1112f game except for
+**four places that only exist in Revision**:
+
+| What | Where | What it is |
+| --- | --- | --- |
+| `RevRootWindow` | `UCMenuRoot` extends it | Revision's root window |
+| `RevMenuScreenNewGame` | `UCNewGame` extends it | Revision's new-game screen |
+| `AttemptPickup` | `UCCustomCarcass` calls it on Super | not in the original 1112f |
+| `SpecialText` | `UCBoot` reads it | "Revision shows SpecialText when..." |
+
+The first two are base classes, so they cannot simply be stubbed: `UCMenuStage` casts to
+`UCMenuRoot`, and the compiler then reports the cast as one that can never succeed. For the
+original game these two classes have to be given a base of their own, or the editor's menu has
+to be written against the original's windows.
+
 ## Licensing
 
 DeusEdix is GPLv3. OpenDE is MIT.
