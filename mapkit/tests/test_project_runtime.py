@@ -195,17 +195,23 @@ class RuntimeTests(unittest.TestCase):
         workspace = module('workspace', self.settings)
         workspace.DIST.mkdir()
         # a build of DeusEdixNav, which install copies into the game (24 Oct 2026: the test passed only where
-        # tools/mapkit/bin held a real one)
+        # tools/mapkit/bin held a real one). On macOS and Linux there is no DLL: the game is not a Windows program
+        # and loads no PE32 library, so only the package is copied.
         native = self.root / 'native'
         native.mkdir()
-        workspace.NATIVE = tuple(native / n for n in ('DeusEdixNav.u', 'DeusEdixNav.dll'))
+        windows = getattr(self.settings, 'WINDOWS', os.name == 'nt')
+        names = ('DeusEdixNav.u', 'DeusEdixNav.dll') if windows else ('DeusEdixNav.u',)
+        workspace.NATIVE = tuple(native / n for n in names)
         for f in workspace.NATIVE:
             f.write_bytes(b'native')
         (workspace.DIST / 'DXP_a.u').write_text('synthetic runtime')
+        # The nav package, as the build leaves it (the editor's dist). Windows installs it with its DLL into the
+        # game's System; elsewhere the package alone goes next to the editor's own.
+        (workspace.DIST / 'DeusEdixNav.u').write_text('synthetic DeusEdixNav.u')
         ini = self.settings.REVISION / 'System/Revision.ini'
         ini.parent.mkdir(parents=True)
         ini.write_text(self.original_ini())
-        native = tuple(self.root / n for n in ('DeusEdixNav.u', 'DeusEdixNav.dll'))
+        native = tuple(self.root / n for n in names)
         for f in native:
             f.write_text('synthetic ' + f.name)
         with patch.object(workspace.subprocess, 'run', return_value=types.SimpleNamespace(stdout='')), \
@@ -213,7 +219,13 @@ class RuntimeTests(unittest.TestCase):
             ok, _lines = workspace.install(log=lambda *args: None)
         self.assertTrue(ok)
         activate.assert_called_once_with()
-        self.assertEqual((self.settings.GAME_SYSTEM / 'DeusEdixNav.dll').read_text(), 'synthetic DeusEdixNav.dll')
+        if windows:
+            # The DLL the GAME loads, into the game's own System folder (Windows only: the game is a PE32 program).
+            self.assertEqual((self.settings.GAME_SYSTEM / 'DeusEdixNav.dll').read_text(), 'synthetic DeusEdixNav.dll')
+        else:
+            # Elsewhere there is no DLL: the package goes next to the editor's own, in the maps folder the game reads.
+            installed = self.settings.MAPS_DIR / 'DeusEdixNav.u'
+            self.assertEqual(installed.read_text(), 'synthetic DeusEdixNav.u')
 
     def test_preferences_share_layout_but_keep_project_content_separate(self):
         self.preferences.save({'deusedix.workspace.v1': 'layout A', 'deusedix.project:a:recent': 'map A'}, 'a')

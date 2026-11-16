@@ -23,6 +23,9 @@ class WorkspacePlayInstallTests(unittest.TestCase):
         for f in native:
             f.write_bytes(b'native ' + f.name.encode())
         (self.dist / 'Unit.u').write_bytes(b'new runtime')
+        # The nav package as the build leaves it in the editor's dist (Windows installs it with its DLL into the
+        # game's System; elsewhere the package alone goes where the editor's own packages are).
+        (self.dist / 'DeusEdixNav.u').write_bytes(b'native DeusEdixNav.u')
         (self.maps / 'Test.dx').write_bytes(b'project map')
         (self.game / 'Test.dx').write_bytes(b'installed map edited outside editor')
         self.settings = types.SimpleNamespace(MAPS_DIR=self.game, GAME_SYSTEM=self.system, PACKAGE='Unit', STANDALONE=True,
@@ -49,10 +52,15 @@ class WorkspacePlayInstallTests(unittest.TestCase):
         self.assertEqual((self.game / 'Unrelated.dx').read_bytes(), b'unrelated')
         self.assertFalse(any('installed map' in line for line in lines))
         self.activate.assert_called_once()
-        # DeusEdixNav, the package the runtime uses: in the game's System folder (its DLL is found only there)
-        self.assertEqual((self.system / 'DeusEdixNav.dll').read_bytes(), b'native DeusEdixNav.dll')
-        self.assertEqual((self.system / 'DeusEdixNav.u').read_bytes(), b'native DeusEdixNav.u')
-        self.assertFalse((self.game / 'DeusEdixNav.dll').exists())
+        # DeusEdixNav, the package the runtime uses: in the game's System folder on Windows (its DLL is found only
+        # there); elsewhere the package alone goes where the editor's own packages are.
+        if getattr(workspace, 'WINDOWS', True):
+            self.assertEqual((self.system / 'DeusEdixNav.dll').read_bytes(), b'native DeusEdixNav.dll')
+            self.assertEqual((self.system / 'DeusEdixNav.u').read_bytes(), b'native DeusEdixNav.u')
+            self.assertFalse((self.game / 'DeusEdixNav.dll').exists())
+        else:
+            self.assertEqual((self.game / 'DeusEdixNav.u').read_bytes(), b'native DeusEdixNav.u')
+            self.assertFalse((self.system / 'DeusEdixNav.dll').exists())
 
     def test_default_install_keeps_existing_map_install_behavior(self):
         ok, _ = workspace.install(log=lambda *_: None)

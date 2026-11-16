@@ -1,8 +1,13 @@
 //=============================================================================
-// UCNavNative - the routes on a map's walkable area, in C++ (DeusEdixNav.dll, native/NavRoute.h): A* over the
-// polygons of a UCNavMesh, then the funnel. UCNavMesh.Route calls it. The package is DeusEdixNav, the same for every
-// project and for the original game and Revision. Its DLL must be next to it in System: without it the engine stops
-// as soon as it loads the package ("'DeusEdixNav' is not a DLL package").
+// UCNavNative - the routes on a map's walkable area, in C++ (native/NavRoute.h): A* over the polygons of a
+// UCNavMesh, then the funnel. UCNavMesh.Route calls it. The package is DeusEdixNav, the same for every project and for
+// the original game and Revision.
+//
+// Where the C++ runs:
+//  - Windows: DeusEdixNav.dll, which must be next to the package in the game's System (without it the game's own
+//    engine stops as soon as it loads the package: "'DeusEdixNav' is not a DLL package").
+//  - macOS and Linux: there is no DLL (it is 32-bit Windows code). OpenDE, the engine that runs the editor and the
+//    game there, answers this same class's Route itself (src/engine/nav_route.cc), so the package needs no library.
 //=============================================================================
 class UCNavNative extends Object
 	native

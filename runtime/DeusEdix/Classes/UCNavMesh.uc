@@ -3,9 +3,10 @@
 // it with Recast (View > Walkable area) and bakes it at Rebuild, as polygons, when characters of the map are
 // sent somewhere "on the walkable area" (Walk / Run to a place).
 //
-// Route(from, to): the route on the polygons, computed in C++ by DeusEdixNav.UCNavNative (DeusEdixNav.dll): A*,
+// Route(from, to): the route on the polygons, computed in C++ by DeusEdixNav.UCNavNative: A*,
 // then the funnel (the straight line that cuts the corners, as Detour does) into Corner[0..NumCorners-1], the last
-// one "to". UCNavRoute walks a character through them with the game's own GoingTo / RunningTo, so it opens doors,
+// one "to". UCNavNative is native code: DeusEdixNav.dll in the game on Windows, OpenDE's own router on macOS and
+// Linux. UCNavRoute walks a character through them with the game's own GoingTo / RunningTo, so it opens doors,
 // turns and animates as the game does.
 //
 // The polygons are numbers in the map (editor/navbake.py writes them): polygon p has Sides[p] corners (3 to 6),
