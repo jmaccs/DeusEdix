@@ -4,6 +4,7 @@
 #   nav_test.exe     NavRoute.h alone, for check_routes.py
 # Then build_package.py compiles DeusEdixNav.u (it needs the DLL: the engine binds the native function at once).
 # -Lab: the SDK headers and libraries (DeusEdix: build_tools\sdk, made by dev\prepare_sdk.py; the mod: editor_lab).
+# The same build without PowerShell: mapkit/native/CMakeLists.txt (Visual Studio's CMake generator, -A Win32).
 param([string]$Lab)
 $ErrorActionPreference = 'Stop'
 if (-not $Lab) {

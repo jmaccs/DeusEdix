@@ -1,18 +1,25 @@
-"""The engine's C++ headers and import libraries the headless host is compiled against, into build_tools\\sdk
-(what mapkit\\host\\build_host.ps1 reads). Nothing of it is in the repository:
+"""The Deus Ex SDK 1112f's C++ headers, and the import libraries of your own game's DLLs, into build_tools/sdk.
+
+Both are for the **Windows** engine bridge only: mapkit/host/UCEngineBridge.cpp is compiled against the SDK's own
+Editor.dll (mapkit/host/build_host.ps1 reads them). The native bridge (mapkit/host/openbridge, built with CMake) is
+compiled against OpenDE's headers and linked against OpenDE's libraries, so it needs neither.
 
 - the headers come from the official Deus Ex SDK 1112f (Headers\\DxHeaders.zip), which you download yourself;
-- the import libraries (Core/Engine/Editor/Window/Extension/ConSys.lib) are made from the exports of your own
-  game's DLLs.
+- the import libraries (Core/Engine/Editor/Window/Extension/ConSys.lib) are made from the exports of your own game's
+  DLLs, with Visual Studio's lib.exe.
 
     python dev\\prepare_sdk.py --headers C:\\path\\to\\DxHeaders.zip --game "C:\\...\\steamapps\\common\\Deus Ex"
+    python3 dev/prepare_sdk.py --headers /path/to/DxHeaders.zip --out build_tools/sdk     (the headers alone)
 
-Needs Visual Studio (or the Build Tools) with the x86 C++ tools: its lib.exe makes the .lib files.
+On a platform that is not Windows there is nothing to make the import libraries with (lib.exe is Visual Studio's)
+and no Windows bridge to make them for: this says so, extracts the headers if it was given them, and stops without
+failing. Nothing of it is in the repository.
 """
 import argparse
 import re
 import struct
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -84,24 +91,53 @@ def exports(dll):
 
 
 def lib_exe():
+    """Visual Studio's lib.exe, or None: a machine without Visual Studio still extracts the headers."""
+    if sys.platform != 'win32':
+        return None
     vswhere = Path(r'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe')
     if not vswhere.exists():
-        raise SystemExit('Visual Studio (or the Build Tools) with the C++ tools is needed')
+        return None
     root = Path(subprocess.check_output([str(vswhere), '-latest', '-products', '*', '-property',
                                          'installationPath']).decode().strip())
-    version = sorted((root / 'VC' / 'Tools' / 'MSVC').iterdir())[-1]
-    return version / 'bin' / 'Hostx64' / 'x86' / 'lib.exe'
+    tools = root / 'VC' / 'Tools' / 'MSVC'
+    if not tools.is_dir():
+        return None
+    return sorted(tools.iterdir())[-1] / 'bin' / 'Hostx64' / 'x86' / 'lib.exe'
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--headers', type=Path, required=True, help="the SDK's Headers\\DxHeaders.zip")
-    ap.add_argument('--game', type=Path, required=True, help='the Deus Ex folder (the one with System\\)')
+    ap = argparse.ArgumentParser(description='The SDK headers and import libraries of the Windows engine bridge.')
+    ap.add_argument('--headers', type=Path, help="the SDK's Headers\\DxHeaders.zip (the Windows bridge's headers)")
+    ap.add_argument('--game', type=Path, help='the Deus Ex folder (the one with System\\): its DLLs make the libraries')
     ap.add_argument('--out', type=Path, default=HERE / 'build_tools' / 'sdk')
+    ap.add_argument('--no-libs', action='store_true', help='the headers alone: no lib.exe and no game folder')
     a = ap.parse_args()
     out = a.out.resolve()
-    extract_headers(a.headers, out)
+    windows = sys.platform == 'win32'
+    if a.headers:
+        extract_headers(a.headers, out)
+        print('headers: %s' % (out / 'headers'))
+    if a.no_libs:
+        print('import libraries: skipped (--no-libs)')
+        return
+    # The import libraries are Visual Studio's, and only mapkit/host/UCEngineBridge.cpp (Windows, Deus Ex's own
+    # engine) is linked against them: skip them with a reason instead of failing.
+    if not windows:
+        print('import libraries: skipped. This is not Windows: they are made with Visual Studio\'s lib.exe and are')
+        print('only used by the Windows engine bridge (mapkit/host/UCEngineBridge.cpp). The native bridge')
+        print('(mapkit/host/openbridge, OpenDE) needs no SDK at all:')
+        print('  cmake -S mapkit/host -B build/host -DCMAKE_BUILD_TYPE=Release -DOPENDE_ROOT=<OpenDE>')
+        return
+    if not a.headers:
+        ap.error('--headers is needed: the Windows engine bridge is compiled against the SDK headers')
+    if not a.game:
+        ap.error('--game is needed: the import libraries are made from the exports of the game\'s DLLs')
     lib = lib_exe()
+    if lib is None:
+        print('lib.exe was not found (Visual Studio or the Build Tools with the C++ tools are not installed): the')
+        print('import libraries were skipped. Only the Windows engine bridge needs them (the SDK headers are in %s).'
+              % (out / 'headers'))
+        return
     for package in PACKAGES:
         dll = a.game / 'System' / (package + '.dll')
         if not dll.exists():

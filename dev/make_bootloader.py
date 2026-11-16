@@ -1,5 +1,6 @@
 """DeusEdix's own build of PyInstaller's bootloader (the small program at the start of DeusEdix.exe and
-deusedix-cli.exe), compiled here from PyInstaller's source with Visual Studio's C compiler.
+deusedix-cli.exe), compiled here from PyInstaller's source with Visual Studio's C compiler. Windows only: it is a
+Windows packaging step. On macOS and Linux nothing runs it (dev/stage.py needs no bootloader).
 
 Why: the bootloaders that come with PyInstaller are the same bytes in every program made with it,
 malware included, so some antivirus engines flag any program that has them (Avira and WithSecure
@@ -35,6 +36,12 @@ def pyinstaller_version():
 
 
 def main():
+    if sys.platform != 'win32':
+        raise SystemExit(
+            'dev/make_bootloader.py builds PyInstaller\'s Windows bootloader: waf drives Visual Studio\'s C\n'
+            'compiler and the result is a Windows PE image for DeusEdix.exe. It is a step of the Windows installer\n'
+            '(dev/build_installer.py), and nothing outside Windows uses a bootloader: on macOS and Linux the editor\n'
+            'is staged and run from its folder (dev/stage.py).')
     version = pyinstaller_version()
     dest = KEEP / version / 'Windows-64bit-intel'
     info = json.load(urllib.request.urlopen('https://pypi.org/pypi/pyinstaller/%s/json' % version))

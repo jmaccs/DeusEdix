@@ -14,6 +14,9 @@ Projects/
 # ---- Made on the user's PC from their own install (caches, builds, user content) --------------
 mapkit/editor/cache/
 mapkit/runs/
+tools/mapkit/runs/
+tools/mapkit/out/
+tools/mapkit/editor/cache/
 mapkit/out/
 mapkit/refs/
 mapkit/catalog/
@@ -71,3 +74,4 @@ node_modules/
 .idea/
 Thumbs.db
 desktop.ini
+.slim/deepwork/

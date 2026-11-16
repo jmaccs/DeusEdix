@@ -7,7 +7,8 @@ UnrealScript has no conditional compilation, so a project for the original game 
 (runtime\\vanilla\\Classes, made from the Revision ones by the changes below: every change must find its
 text, or the generation stops). Revision's own files stay exactly as they are.
 
-    python dev\\vanilla_runtime.py <runtime Classes folder> <output folder>
+    python3 dev/vanilla_runtime.py <runtime Classes folder> <output folder>
+    python3 dev/vanilla_runtime.py            (runtime/DeusEdix/Classes -> runtime/vanilla/Classes)
 """
 import hashlib
 import re
@@ -127,4 +128,7 @@ def make(classes, out):
 
 
 if __name__ == '__main__':
-    print('made', make(sys.argv[1], sys.argv[2]))
+    here = Path(__file__).resolve().parents[1]
+    classes = Path(sys.argv[1]) if len(sys.argv) > 1 else here / 'runtime' / 'DeusEdix' / 'Classes'
+    out = Path(sys.argv[2]) if len(sys.argv) > 2 else here / 'runtime' / 'vanilla' / 'Classes'
+    print('made', make(classes, out))

@@ -1,4 +1,6 @@
-"""Build DeusEdix's installer: build\\installer\\DeusEdix-Setup-<v>.exe.
+"""Build DeusEdix's Windows installer: build\\installer\\DeusEdix-Setup-<v>.exe. Windows only: Inno Setup, PyInstaller's
+own bootloader compiled with Visual Studio and a Windows .venv are behind it. On macOS and Linux the program is
+staged with dev/stage.py instead (the host and the OpenDE bridge are built by mapkit/host/CMakeLists.txt).
 
     .venv\\Scripts\\python dev\\build_installer.py [--version 0.1.0] [--no-sync]
 
@@ -74,6 +76,15 @@ def run(args, **kw):
 
 
 def main():
+    if sys.platform != 'win32':
+        raise SystemExit(
+            'dev/build_installer.py builds the Windows installer: it runs Inno Setup (ISCC.exe), uses the Windows\n'
+            '.venv (.venv\\Scripts\\python.exe) and installs PyInstaller\'s Windows bootloader, which\n'
+            'dev/make_bootloader.py compiles with Visual Studio. None of those exist on this platform.\n'
+            'On macOS and Linux the program is staged instead:\n'
+            '  cmake -S mapkit/host -B build/host -DCMAKE_BUILD_TYPE=Release -DOPENDE_ROOT=<the OpenDE tree>\n'
+            '  cmake --build build/host\n'
+            '  python3 dev/stage.py --clean')
     ap = argparse.ArgumentParser()
     ap.add_argument('--version', default='0.1.0')
     ap.add_argument('--no-sync', action='store_true')
