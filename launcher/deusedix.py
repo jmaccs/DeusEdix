@@ -16,21 +16,35 @@
 The editor's code is not inside the program: it sits next to it (tools\\mapkit, src\\DeusEdix), in the
 user's install folder, where it also keeps its caches, runs and workspace. The program is Python with
 the libraries the code needs, a window (WebView2) and this launcher.
+
+On macOS and Linux there is no WebView2: the editor, a web page, opens in the user's own browser (or in a
+window when the installed pywebview has a backend for the platform: Cocoa/WebKit on macOS, GTK or Qt on
+Linux). The page talks to the editor's server over http://127.0.0.1:<port> and never touches the host
+directly, so it is the same editor either way.
 """
 import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import traceback
+import webbrowser
 from pathlib import Path
 
 FROZEN = getattr(sys, 'frozen', False)
-APP = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parents[1] / 'build' / 'app'
-KIT = APP / 'tools' / 'mapkit'
-CONFIG = APP / 'deusedix.json'
-LOGS = APP / 'logs'
+# The repository, which is where the launcher runs from unless it is frozen (an installed program has APP below).
+SOURCE = Path(__file__).resolve().parents[1]
+APP = Path(sys.executable).resolve().parent if FROZEN else SOURCE / 'build' / 'app'
+# The program's folder as dev\stage.py (or the installer) lays it out: tools\mapkit, the host, deusedix.json. Before it
+# is staged (the repository itself, as on macOS and Linux, where no staging is needed to run the editor) the editor's
+# code is the repository's own mapkit\ and its config and logs sit at its top, where settings.py reads them.
+STAGED = FROZEN or (APP / 'tools' / 'mapkit').is_dir()
+DATA = APP if STAGED else SOURCE
+KIT = DATA / 'tools' / 'mapkit' if STAGED else SOURCE / 'mapkit'
+CONFIG = DATA / 'deusedix.json'
+LOGS = DATA / 'logs'
 STEAM = {'Deus Ex: Game of the Year Edition on Steam': 'https://store.steampowered.com/app/6910/',
          'Deus Ex: Game of the Year Edition on GOG': 'https://www.gog.com/en/game/deus_ex',
          'Deus Ex: Revision on Steam': 'https://store.steampowered.com/app/397550/'}
@@ -42,7 +56,7 @@ def trace(*a):
     """One line in logs\\launcher.log: what the launcher did, for when something goes wrong."""
     try:
         import time
-        LOGS.mkdir(exist_ok=True)
+        LOGS.mkdir(parents=True, exist_ok=True)
         with open(LOGS / 'launcher.log', 'a', encoding='utf-8') as f:
             f.write('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), ' '.join(str(x) for x in a)))
     except OSError:
@@ -50,7 +64,7 @@ def trace(*a):
 
 
 def _paths():
-    for p in (KIT / 'editor', KIT, APP / 'tools'):
+    for p in ((KIT / 'editor', KIT, APP / 'tools') if STAGED else (KIT / 'editor', KIT)):
         if str(p) not in sys.path:
             sys.path.insert(0, str(p))
 
@@ -103,6 +117,43 @@ def _free_port():
             if s.connect_ex(('127.0.0.1', port)) != 0:
                 return port
     return 0
+
+
+# ---------------------------------------------------------------- the platform
+def _window_backend():
+    """pywebview's GUI backend (webview.start's gui=) on this platform, or None for pywebview to take the one it finds
+    (GTK or Qt on Linux)."""
+    return {'win32': 'edgechromium', 'darwin': 'cocoa'}.get(sys.platform)
+
+
+def _window_ready():
+    """Why the editor's own window cannot be made here ('' when it may be): Microsoft's Edge WebView2 on Windows, the
+    pyobjc/WebKit that pywebview's Cocoa backend is built on on macOS. Linux is left to pywebview, which takes GTK or
+    Qt, whichever it finds. The editor's page works in the browser either way, so this is no reason to fail."""
+    if sys.platform == 'win32':
+        return '' if _webview2() else 'Microsoft Edge WebView2 is not installed: the editor\'s own window needs it'
+    if sys.platform == 'darwin':
+        try:
+            import objc                                            # noqa: F401  pywebview.platforms.cocoa
+            import WebKit                                          # noqa: F401
+        except Exception as exc:
+            return ('pywebview cannot make a window here (its Cocoa backend needs pyobjc: objc and WebKit): %s' % exc)
+    return ''
+
+
+def _open_url(url):
+    """An address in the user's own browser: the shell's default browser on Windows, `open` on macOS, `xdg-open` on
+    Linux (or Python's own browser module when the platform's command is not there). Never waits for the browser."""
+    if sys.platform == 'win32':
+        os.startfile(url)
+        return
+    command = 'open' if sys.platform == 'darwin' else 'xdg-open'
+    try:
+        subprocess.Popen([command, url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        trace('could not open the browser with', command, exc)
+        webbrowser.open(url)
 
 
 # ---------------------------------------------------------------- the window
@@ -244,13 +295,13 @@ class Api:
 
     def open(self, url):
         if url.startswith(STORES):
-            os.startfile(url)
+            _open_url(url)
 
     # asked by the editor's menu bar (menubar.js)
     def open_url(self, url):
         """The guide (served by the editor here) or a web page, in the user's browser."""
         if re.match(r'^(https://|http://(127\.0\.0\.1|localhost):\d+/)', str(url)):
-            os.startfile(url)
+            _open_url(url)
 
     def fullscreen(self):
         self._window.toggle_fullscreen()
@@ -375,7 +426,15 @@ def _wine():
 
 
 def _message(text, error=False):
-    """A plain Windows message box (no .NET needed): blocks until OK."""
+    """A plain message that waits for nothing: the Windows message box (no .NET needed), or the terminal's own error
+    output on macOS and Linux, where there is no message box (a program started from a terminal, or else its log, which
+    sys.stdout and sys.stderr are)."""
+    if sys.platform != 'win32':
+        try:
+            print(text, file=sys.__stderr__ or sys.stderr, flush=True)
+        except Exception:
+            pass
+        return
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(None, text, 'DeusEdix', 0x10 if error else 0x40)
@@ -403,7 +462,7 @@ def browser(reason):
         import browser_session
         trace('editor opened in the browser', url)
         (LOGS / 'start-error.txt').unlink(missing_ok=True)
-        os.startfile(url)
+        _open_url(url)
         if not browser_session.wait_for_first(90):
             # no browser opened it: say where it is, and wait for a page a while longer
             trace('no page yet: showing the address')
@@ -436,33 +495,39 @@ def _shutdown_projects():
 
 
 def gui(args=()):
-    LOGS.mkdir(exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / 'editor.log', 'a', encoding='utf-8', buffering=1)
     sys.stdout = sys.stderr = log                    # a windowed program has no console
     import faulthandler
     faulthandler.enable(file=log)
     if os.environ.get('DEUSEDIX_DEBUG'):
         faulthandler.dump_traceback_later(40, repeat=False, file=log)     # where every thread is, if it hangs
-    trace('DeusEdix', VERSION, 'starting in', APP)
+    trace('DeusEdix', VERSION, 'starting in', DATA)
     if '--browser' in args or os.environ.get('DEUSEDIX_BROWSER') == '1':
         browser('asked for the browser')
     if _wine():
         browser('Wine or Proton: the editor\'s own window needs Windows')
-    if not _webview2():
-        browser('Microsoft Edge WebView2 is not installed: the editor\'s own window needs it')
+    reason = _window_ready()
+    if reason:
+        browser(reason)
     try:
         import webview
     except Exception:
         trace('no window library', traceback.format_exc())
-        browser('the editor\'s own window could not load (.NET Framework)')
-    api = Api()
-    window = webview.create_window('DeusEdix', html=PAGE, js_api=api, width=1600, height=960, min_size=(1024, 640),
-                                   background_color='#0d1420')
-    api._window = window
-    window.events.closing += api._on_closing
+        browser('the editor\'s own window could not load (pywebview%s)'
+                % (', .NET Framework' if sys.platform == 'win32' else ''))
     try:
-        webview.start(_start, (window, api), gui='edgechromium', private_mode=False,
-                      storage_path=str(APP / 'webview'), debug=bool(os.environ.get('DEUSEDIX_DEBUG')))
+        api = Api()
+        window = webview.create_window('DeusEdix', html=PAGE, js_api=api, width=1600, height=960, min_size=(1024, 640),
+                                       background_color='#0d1420')
+        api._window = window
+        window.events.closing += api._on_closing
+    except Exception:
+        trace('no window', traceback.format_exc())
+        browser('the editor\'s own window could not be made on this platform')
+    try:
+        webview.start(_start, (window, api), gui=_window_backend(), private_mode=False,
+                      storage_path=str(DATA / 'webview'), debug=bool(os.environ.get('DEUSEDIX_DEBUG')))
         trace('window closed')
     except Exception:
         trace('window failed', traceback.format_exc())

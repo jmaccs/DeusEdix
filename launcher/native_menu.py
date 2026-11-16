@@ -3,13 +3,22 @@
 The WebView still owns command validation and keyboard shortcuts. Native items
 display those shortcuts, but deliberately do not register a second shortcut
 handler: editing text must continue to use the WebView's normal focus rules.
+
+Windows only: the items are WinForms ones (pythonnet), put on the form of the
+editor's own WebView2 window. On macOS and Linux pywebview has no such form (and
+in the browser there is no window at all), so install() and update() answer
+False and the page's own menu bar (menubar.js) stays the editor's menu.
 """
 import json
 import re
+import sys
 import threading
 
 
 _ID = re.compile(r'^m[0-9]{1,2}_[0-9]{1,3}$')
+# Windows has a form to put a native menu on; macOS and Linux have none, and the
+# browser has no window at all.
+SUPPORTED = sys.platform == 'win32'
 
 
 def _text(value, limit, field):
@@ -164,6 +173,9 @@ class NativeMenus:
         self._menu.Enabled = any(heading.Enabled for heading in self._menu.Items)
 
     def install(self, menu_snapshot):
+        if not SUPPORTED:
+            self._last_error = 'A native menu needs Windows; the page\'s own menu bar stays'
+            return False
         try:
             snapshot = _snapshot(menu_snapshot)
             structure = [(menu['title'], [item.get('id') for item in menu['items']]) for menu in snapshot]
@@ -243,6 +255,8 @@ class NativeMenus:
             return False
 
     def update(self, states):
+        if not SUPPORTED:
+            return False
         try:
             # Validate once before UI dispatch and again against the current
             # registry on the UI thread, where installs/updates are serialized.

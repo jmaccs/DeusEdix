@@ -18,6 +18,7 @@ of their executables, and Continue in game window, which brings the game's windo
 (review su4).
 
     .venv/Scripts/python.exe -m unittest discover -s launcher -p "test_*.py"
+    python3 -m unittest discover -s launcher -p "test_*.py"           (macOS, Linux: the real Win32 cases are skipped)
 """
 import ctypes
 from ctypes import wintypes
@@ -27,6 +28,7 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -40,6 +42,23 @@ import native_play                                                  # noqa: E402
 
 GWL_STYLE, GWL_EXSTYLE = -16, -20
 SCREEN = (0, 0, 3840, 2160)
+GAME_FOLDER = 'C:/Games/Deus Ex'                                    # the folder the stand-ins' Play runs from
+
+
+def platform_paths(folder=GAME_FOLDER):
+    """`folder`, the path of its game, and those of a link to that game and of a copy of it elsewhere, spelled as the
+    platform spells paths: the cover compares the path Windows gives a process with the game folder's through
+    os.path.normcase, which is the platform's, so the stand-ins on macOS and Linux take paths of those platforms (an
+    absolute one: Path.resolve leaves it as it is) instead of the C:\\ ones a Windows game has."""
+    if sys.platform == 'win32':
+        return (folder, folder + '/Revision/System/Revision.exe',
+                r'C:\Link\Revision\System\Revision.exe', r'C:\Copy\System\DeusEx.exe')
+    base = Path(tempfile.gettempdir()).resolve()
+    return (str(base / 'Deus Ex'), str(base / 'Deus Ex' / 'Revision' / 'System' / 'Revision.exe'),
+            str(base / 'Link' / 'Revision' / 'System' / 'Revision.exe'),
+            str(base / 'Copy' / 'System' / 'DeusEx.exe'))
+
+
 # Revision's window as the runs of 28 Oct 2026 saw it: captioned as it appears, full screen after the start-up SetRes
 # of StartupFullscreen=True (run 1), minimized as a child of the panel (run 2)
 WINDOWED = dict(style=0x14cf0000, exstyle=0x00040100, rect=(0, 0, 3866, 2190))
@@ -164,7 +183,7 @@ class Win:
     so."""
     def __init__(self, look):
         self.look = dict(look, parent=None, enabled=True)
-        self.path = 'C:/Games/Deus Ex/Revision/System/Revision.exe'
+        self.path = GAME_FOLDER + '/Revision/System/Revision.exe'
         self.calls, self.threads = [], set()
         self.running = self.window = self.answering = True
         self.box = self.active = False
@@ -409,12 +428,12 @@ class SetResWin(Win):
         return reached
 
 
-def made(win, clock, ui=None, state=None):
+def made(win, clock, ui=None, state=None, folder=GAME_FOLDER):
     """A NativeGamePanel of a project whose Play runs (token play-1, or as `state` says), on `win`, with the clock
-    `clock`."""
+    `clock`, and its game in the game folder `folder`."""
     window = SimpleNamespace(native=Form(ui))
     state = dict(owned=True, running=True, pid=123, token='play-1', created='1') if state is None else state
-    panel = native_play.NativeGamePanel(window, lambda: 'C:/Games/Deus Ex', _win=win, _native_bindings=BINDINGS,
+    panel = native_play.NativeGamePanel(window, lambda: folder, _win=win, _native_bindings=BINDINGS,
                                         _session_lookup=lambda session: state, _worker_check=lambda session: None,
                                         _clock=clock)
     return panel, window.native
@@ -1132,11 +1151,11 @@ class CoverTests(unittest.TestCase):
     2026), on stand-ins (the editor's window is the form's 200)"""
     CHANGES = ('topmost', 'style', 'parent', 'position', 'enabled', 'focus')
 
-    def covered(self, win=None, clock=None):
+    def covered(self, win=None, clock=None, folder=GAME_FOLDER):
         """a panel whose cover went on (the page's game_cover at the launch), its game not started yet"""
         win, clock = win or Win(WINDOWED), clock or Clock()
         win.window = False
-        panel, form = made(win, clock)
+        panel, form = made(win, clock, folder=folder)
         self.assertEqual(panel.cover(True), dict(covered=True, error=''))
         self.assertEqual([c for c in win.calls if c[0] in self.CHANGES], [('topmost', True, None)])
         self.assertEqual((panel.status()['covered'], panel._cover_timer.running), (True, True))
@@ -1313,8 +1332,8 @@ class CoverTests(unittest.TestCase):
         # that no longer answered held it 21 s at the cover's first look. Only an executable named as one of GAMES' is
         # resolved, and only when its path as Windows gives it is none of the cover's GAMES: the game's own needs no
         # resolving, the game started through a link and a copy of it elsewhere do (GAME_NAMES)
-        link, copy = r'C:\Link\Revision\System\Revision.exe', r'C:\Copy\System\DeusEx.exe'
-        links = {link: 'C:/Games/Deus Ex/Revision/System/Revision.exe'}
+        folder, game, link, copy = platform_paths()
+        links = {link: game}
         splash, theirs = (76, 123), [(87, 4242), (86, 4343)]
         cases = {"other programs' dialogs only: no end": (splash, None, None, []),
                  "another program's window in front: behind it": ((999, 4444), None, 999, []),
@@ -1323,7 +1342,9 @@ class CoverTests(unittest.TestCase):
                  'the box of a copy of the game elsewhere: no end': (splash, 5252, None, [copy])}
         for name, (front, box, behind, expected) in cases.items():
             with self.subTest(name):
-                panel, form, win, clock = self.covered()
+                win = Win(WINDOWED)
+                win.path = game                                  # the game this Play runs, in its own folder
+                panel, form, win, clock = self.covered(win, folder=folder)
                 win.others.update({4242: r'\\nas\apps\tool.exe', 4343: 'N:/Viewer/viewer.exe',
                                    4444: r'\\nas\apps\editor.exe', 5151: link, 5252: copy})
                 win.dialogs, win.in_front_now = {86, 87, 88}, front
