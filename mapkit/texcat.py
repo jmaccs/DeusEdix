@@ -6,7 +6,6 @@ Packages are taken as the game loads them: Revision\\Textures, then Revision\\Ne
 (HD versions), then the base Deus Ex\\Textures. Sheets land in tools\\mapkit\\catalog\\<pkg>-N.jpg
 and an index tools\\mapkit\\catalog\\<pkg>.txt (number, group.name, size).
 """
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,8 +19,8 @@ from ue1pkg import Pkg  # noqa: E402
 GAME = settings.GAME
 SEARCH = list(settings.TEXTURE_DIRS)      # the targeted game's: Revision's first, or only the original game's
 CATALOG = HERE / 'catalog'
-FF = shutil.which('ffmpeg') or r'C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe'
-FONT = 'C\\:/Windows/Fonts/arial.ttf'
+FF = settings.ffmpeg()
+FONT = settings.label_font()
 SKIP = {'FractalTexture', 'FireTexture', 'WaterTexture', 'WaveTexture', 'WetTexture', 'IceTexture',
         'ScriptedTexture', 'Palette', 'Package', 'Font', 'TrueTypeFontFactory'}
 

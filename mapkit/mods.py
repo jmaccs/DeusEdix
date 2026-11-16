@@ -17,6 +17,7 @@ the next start of an editor of that game (launch_copies, live.tidy_cut_short).
 """
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,10 +27,13 @@ from pathlib import Path
 
 import settings
 
+WINDOWS = getattr(settings, 'WINDOWS', os.name == 'nt')
 FORMAT = 1
 EXT = '.dxmod'
 MODS_DIR = 'DeusEdixMods'
-EXPORTS = Path.home() / 'Documents' / 'DeusEdix Mods'          # where Export mod... saves, easy to find
+# where Export mod... saves, easy to find: the user's own Documents folder (on Linux its XDG_DOCUMENTS_DIR)
+DOCUMENTS = getattr(settings, 'documents_dir', lambda: Path.home() / 'Documents')()
+EXPORTS = DOCUMENTS / 'DeusEdix Mods'
 MAX_FILE = 256 * 1024 * 1024
 MAX_TOTAL = 1024 * 1024 * 1024
 MAX_COVER = 4 * 1024 * 1024
@@ -55,6 +59,11 @@ def mods_root(target):
 
 
 def _running(target):
+    """Is that game running? By its program's name on Windows (tasklist's IMAGENAME filter); on macOS and Linux the
+    game is its data, started by OpenDE's own program (settings.game_running)."""
+    if not WINDOWS:
+        check = getattr(settings, 'game_running', None)
+        return bool(check) and check(target)
     exe = settings.TARGETS[target]['exe']
     r = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ' + exe], capture_output=True, text=True,
                        creationflags=subprocess.CREATE_NO_WINDOW)

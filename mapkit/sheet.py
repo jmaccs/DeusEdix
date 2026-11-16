@@ -1,10 +1,12 @@
-"""Contact sheet of a photo folder (shots\\<run>): python tools\\mapkit\\sheet.py <folder> [cols] [width]"""
-import shutil
+"""Contact sheet of a photo folder (shots/<run>): python mapkit/sheet.py <folder> [cols] [width]"""
 import subprocess
 import sys
 from pathlib import Path
 
-FF = shutil.which('ffmpeg') or r'C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import settings  # noqa: E402
+
+FF = settings.ffmpeg()
 
 
 def sheet(folder, cols=3, width=640, pattern='*.png', out_name='sheet.jpg'):

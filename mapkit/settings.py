@@ -9,7 +9,8 @@ The editor runs in two ways:
    says so, with the game folder found or picked there. The package is then DeusEdix, compiled on
    the user's PC, and the maps go to Revision\\DeusEdixMaps.
 
-The game folder is the one holding Deus Ex's System and Revision (Steam: steamapps\\common\\Deus Ex).
+The game folder is the one holding Deus Ex's System and Revision (Steam: steamapps\\common\\Deus Ex). On Windows
+that is the game as it ships, its programs and all; on macOS and Linux it is the game's data, which OpenDE runs.
 
 Two games can be the target, one per project (TARGET, fixed when the project is made): Deus Ex: Revision
 ('revision', in the game folder's Revision\\ with its own System, Maps, ini files) and the original Deus Ex,
@@ -22,14 +23,61 @@ import json
 import os
 import re
 import hashlib
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
-PROJECT = Path(__file__).resolve().parents[2]
+# The games, their programs and Steam's registry are Windows'; macOS and Linux read the same game as data (a folder
+# of System, Maps, Textures...) started by a wrapper (here, OpenDE), so nothing of the game is a program there.
+WINDOWS = os.name == 'nt'
+MACOS = sys.platform == 'darwin'
+
+
+def _project_folder(code):
+    """The folder DeusEdix keeps its files in: its install folder, which holds the editor's code in tools/mapkit (the
+    installer's layout: settings, the workspace, the caches and the user's work all next to it), or the editor's own
+    folder when the code is checked out as itself (mapkit/ at the top, its usual development layout)."""
+    parent = Path(code).resolve().parent
+    return parent.parent if parent.name == 'tools' else parent
+
+
+def build_bin():
+    """Where the host and its engine bridge are: the editor's own folder in the install layout (the build puts them
+    in tools/mapkit/bin, next to this code), or build/host/bin in a checkout (CMake writes them there). Which layout
+    this is, is told by where the editor's own code is, not by a folder that happens to exist."""
+    here = Path(__file__).resolve().parent
+    if here.parent.name == 'tools':                  # the install layout: this code is in tools/mapkit
+        return here / 'bin'
+    return here.parent / 'build' / 'host' / 'bin'
+
+
+def data_dir():
+    """The platform's own folder for this user's DeusEdix data, for when the editor's folder is not one the user
+    writes in (a system-wide install, a read-only package): %LOCALAPPDATA%\\DeusEdix on Windows,
+    ~/Library/Application Support/DeusEdix on macOS, $XDG_DATA_HOME/DeusEdix (or ~/.local/share/DeusEdix) on Linux.
+    DEUSEDIX_DATA_DIR names it instead, then DEUSEDIX_APP_ROOT (the launcher gives its workers this one): the editor
+    must find the same folder for the whole of a run, so one of them is set before settings is imported."""
+    given = os.environ.get('DEUSEDIX_DATA_DIR') or os.environ.get('DEUSEDIX_APP_ROOT')
+    if given:
+        return Path(given).expanduser().resolve()
+    if WINDOWS:
+        return (Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'DeusEdix').resolve()
+    if MACOS:
+        return (Path.home() / 'Library' / 'Application Support' / 'DeusEdix').resolve()
+    return (Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share') / 'DeusEdix').resolve()
+
+
+PROJECT = _project_folder(Path(__file__).resolve().parent)
 CONFIG = PROJECT / 'deusedix.json'
 APP_ROOT = Path(os.environ.get('DEUSEDIX_APP_ROOT') or PROJECT).resolve()
 PROJECT_FILE = PROJECT / 'deusedix-project.json'
-STEAM_DEFAULT = Path(r'C:\Program Files (x86)\Steam')
+# where the workspace, the compiled packages and the logs go: next to the code, as the installer lays it out, or the
+# platform's own place for this user's data when that folder is not writable (DATA_DIR is the same folder as PROJECT
+# on Windows and in a checkout: the layout is unchanged there). DEUSEDIX_DATA_DIR names it outright
+DATA_DIR = (Path(os.environ['DEUSEDIX_DATA_DIR']).expanduser().resolve() if os.environ.get('DEUSEDIX_DATA_DIR')
+            else (PROJECT if os.access(PROJECT, os.W_OK) else data_dir()))
+STEAM_DEFAULT = Path(r'C:\Program Files (x86)\Steam') if WINDOWS else None
 APPS = {'6910': 'Deus Ex: Game of the Year Edition', '397550': 'Deus Ex: Revision'}
 # the games a project can be made for: where each one lives in the Deus Ex folder (root), its program, its
 # ini files and their sections with the folders the game reads (Paths), the default user ini beside its user ini that
@@ -97,9 +145,15 @@ def _project():
     return {key: value[key] for key in ('id', 'name', 'kind', 'package', 'target') if key in value} | {'path': str(PROJECT), 'legacy': False}
 
 
-def steam_libraries():
-    """The Steam library folders of this PC: the Steam folder from the registry, then the ones in
-    steamapps\\libraryfolders.vdf."""
+def _steam_roots():
+    """The Steam folders of this PC: the ones its installer writes in the registry on Windows, the usual ones on
+    macOS (~/Library/Application Support/Steam) and Linux (~/.steam/steam, the Flatpak's data folder...)."""
+    if not WINDOWS:
+        home = Path.home()
+        return [home / 'Library' / 'Application Support' / 'Steam',
+                home / '.steam' / 'steam',
+                home / '.local' / 'share' / 'Steam',
+                home / '.var' / 'app' / 'com.valvesoftware.Steam' / 'data' / 'Steam']
     roots = []
     try:
         import winreg
@@ -114,10 +168,23 @@ def steam_libraries():
     except ImportError:
         pass
     roots.append(STEAM_DEFAULT)
+    return roots
+
+
+def _library(path):
+    """A library folder as this system names folders: the vdf files write Windows paths with doubled backslashes on
+    Windows (where '/' would work too), and POSIX paths elsewhere."""
+    text = str(path)
+    return Path(text.replace('\\\\', '\\').replace('/', '\\')) if WINDOWS else Path(text)
+
+
+def steam_libraries():
+    """The Steam library folders of this PC: the Steam folder from the registry (Windows) or the usual ones (macOS,
+    Linux), then the ones in steamapps/libraryfolders.vdf."""
     out = []
-    for root in roots:
-        for lib in [root] + _vdf_paths(root / 'steamapps' / 'libraryfolders.vdf'):
-            lib = Path(str(lib).replace('/', '\\'))
+    for root in _steam_roots():
+        for lib in [root] + _vdf_paths(Path(root) / 'steamapps' / 'libraryfolders.vdf'):
+            lib = _library(lib)
             if lib.is_dir() and all(lib.resolve() != o.resolve() for o in out):
                 out.append(lib)
     return out
@@ -128,22 +195,58 @@ def _vdf_paths(vdf):
         text = vdf.read_text(encoding='utf-8', errors='replace')
     except OSError:
         return []
-    return [Path(m.replace('\\\\', '\\')) for m in re.findall(r'"path"\s+"([^"]+)"', text)]
+    return [Path(m) for m in re.findall(r'"path"\s+"([^"]+)"', text)]
+
+
+# the packages a Deus Ex install's System folder holds (the game's own code; Revision's own in Revision\System): the
+# game is its data on macOS and Linux, where the Windows programs it ships are not run as they are
+GAME_PACKAGES = ('Core.u', 'DeusEx.u')
+REVISION_PACKAGES = ('Revision.u', 'RevisionMission.u')
+
+
+def _data_missing(folder, packages):
+    """What a game's data folder lacks: its System with these packages, its Maps with a map in them ('' when nothing
+    is missing)."""
+    wanted = ['System/' + name for name in packages if not (folder / 'System' / name).is_file()]
+    if wanted:
+        return ', '.join(wanted)
+    return '' if any((folder / 'Maps').glob('*.dx')) else 'Maps'
 
 
 def check_game(folder, target=DEFAULT_TARGET):
     """What is missing for the editor in a game folder to make maps for `target`: [] when it is good.
-    Both need the original game (its Editor.dll is the editor's engine, Revision reads some of its files)."""
+    Both need the original game (its Editor.dll is the editor's engine, Revision reads some of its files). On Windows
+    it is the game as it ships, its program and all. On macOS and Linux it is the game's data (System with its own
+    packages, Maps): the Windows programs it ships are started through a wrapper, so their absence says nothing."""
     folder = Path(folder)
     missing = []
-    if not (folder / 'System' / 'Editor.dll').is_file():
-        missing.append('Deus Ex (System\\Editor.dll)')
-    if target == 'vanilla':
-        if not (folder / 'System' / 'DeusEx.exe').is_file():
-            missing.append('Deus Ex (System\\DeusEx.exe)')
-    elif not (folder / 'Revision' / 'System' / 'Revision.exe').is_file():
-        missing.append('Deus Ex: Revision (Revision\\System\\Revision.exe)')
+    if WINDOWS:
+        if not (folder / 'System' / 'Editor.dll').is_file():
+            missing.append('Deus Ex (System\\Editor.dll)')
+        if target == 'vanilla':
+            if not (folder / 'System' / 'DeusEx.exe').is_file():
+                missing.append('Deus Ex (System\\DeusEx.exe)')
+        elif not (folder / 'Revision' / 'System' / 'Revision.exe').is_file():
+            missing.append('Deus Ex: Revision (Revision\\System\\Revision.exe)')
+        return missing
+    lacking = _data_missing(folder, GAME_PACKAGES)
+    if lacking:
+        missing.append('Deus Ex (%s)' % lacking)
+    if target == 'revision':
+        lacking = _data_missing(folder / 'Revision', REVISION_PACKAGES)
+        if lacking:
+            missing.append('Deus Ex: Revision (Revision/%s)' % lacking)
     return missing
+
+
+def game_installed(folder, target=DEFAULT_TARGET):
+    """Is the game of `target` in this game folder? Its program on Windows, where the game is a program and the
+    uninstaller always asked for it; its data on macOS and Linux (check_game), where there is no such program."""
+    folder = Path(folder)
+    if WINDOWS:
+        profile = TARGETS[target]
+        return ((folder / profile['root'] if profile['root'] else folder) / 'System' / profile['exe']).is_file()
+    return not check_game(folder, target)
 
 
 def games_in(folder):
@@ -151,14 +254,18 @@ def games_in(folder):
     return [t for t in TARGETS if folder and not check_game(folder, t)]
 
 
-# the original game from GOG (GOG Galaxy or its offline installer): no Steam, its DeusEx.exe starts by itself
-GOG_FOLDERS = (r'C:\GOG Games\Deus Ex GOTY', r'C:\GOG Games\Deus Ex',
-               r'C:\Program Files (x86)\GOG Galaxy\Games\Deus Ex GOTY', r'C:\Program Files (x86)\GOG Galaxy\Games\Deus Ex',
-               r'C:\Program Files (x86)\GOG.com\Deus Ex GOTY', r'C:\Program Files (x86)\GOG.com\Deus Ex')
+# the original game from GOG (GOG Galaxy or its offline installer): no Steam, its DeusEx.exe starts by itself. GOG
+# installs for Windows; macOS and Linux have the game as the data folder given below (default_game)
+GOG_FOLDERS = ((r'C:\GOG Games\Deus Ex GOTY', r'C:\GOG Games\Deus Ex',
+                r'C:\Program Files (x86)\GOG Galaxy\Games\Deus Ex GOTY', r'C:\Program Files (x86)\GOG Galaxy\Games\Deus Ex',
+                r'C:\Program Files (x86)\GOG.com\Deus Ex GOTY', r'C:\Program Files (x86)\GOG.com\Deus Ex')
+               if WINDOWS else ())
 
 
 def gog_games():
     """Deus Ex folders installed by GOG: the ones in GOG's registry (named Deus Ex), then the usual folders."""
+    if not WINDOWS:
+        return []                       # GOG ships the game for Windows; elsewhere it is the data folder, not an install
     out = []
     try:
         import winreg
@@ -183,9 +290,30 @@ def gog_games():
     return [p for i, p in enumerate(out) if p.is_dir() and all(str(p).lower() != str(o).lower() for o in out[:i])]
 
 
+def default_game():
+    """Where the game (its data, where the game is not a program) may be before it is looked for: Steam's usual folder
+    on Windows; on macOS and Linux the folder OpenDE is given the game in (README: DEUSEX_GAME_DATA), else a
+    game-data folder next to the editor or next to the editor's folder."""
+    if WINDOWS:
+        return Path(r'C:\Program Files (x86)\Steam\steamapps\common\Deus Ex')
+    given = os.environ.get('DEUSEX_GAME_DATA')
+    if given:
+        return Path(given).expanduser().resolve()
+    for base in (APP_ROOT, PROJECT, PROJECT.parent):
+        folder = Path(base) / 'game-data'
+        if (folder / 'System').is_dir():
+            return folder.resolve()
+    return (APP_ROOT / 'game-data').resolve()
+
+
 def find_game(target=DEFAULT_TARGET):
-    """The Deus Ex folder good for `target` (with Revision in it, for Revision), from Steam's manifests
-    (apps 6910 and 397550 both install into steamapps\\common\\Deus Ex), then GOG's (the original game), or None."""
+    """The Deus Ex folder good for `target` (with Revision in it, for Revision), from the folder it is given in on
+    macOS and Linux (default_game), Steam's manifests (apps 6910 and 397550 both install into steamapps\\common\\
+    Deus Ex), then GOG's (the original game), or None."""
+    if not WINDOWS:
+        given = default_game()
+        if not check_game(given, target):
+            return given
     for lib in steam_libraries():
         for app in APPS:
             manifest = lib / 'steamapps' / ('appmanifest_%s.acf' % app)
@@ -212,17 +340,49 @@ def from_steam(folder):
         return False
 
 
+def game_program():
+    """The program that runs the game's data on macOS and Linux: OpenDE's own (DEUSEDIX_GAME_PROGRAM, the build of
+    the tree the editor is in, or one on PATH). '' when there is none: the game's own .exe needs a Windows wrapper."""
+    if WINDOWS:
+        return ''
+    given = os.environ.get('DEUSEDIX_GAME_PROGRAM')
+    if given:
+        return given
+    for base in (PROJECT, PROJECT.parent, APP_ROOT, APP_ROOT.parent):
+        for name in ('deusex', os.path.join('deusex.app', 'Contents', 'MacOS', 'deusex')):
+            program = Path(base) / 'build' / 'bin' / name
+            if program.is_file():
+                return str(program)
+    return shutil.which('deusex') or ''
+
+
+def steam_program():
+    """The Steam program that starts a game with its own launch options: SteamExe from the registry on Windows,
+    `steam` (or Steam.app's own program) on macOS and Linux. '' when it is not found."""
+    if not WINDOWS:
+        found = shutil.which('steam')
+        if found:
+            return found
+        app = Path('/Applications/Steam.app/Contents/MacOS/steam_osx')
+        return str(app) if MACOS and app.is_file() else ''
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as key:
+        return str(Path(winreg.QueryValueEx(key, 'SteamExe')[0]).resolve())
+
+
 def game_command(args, target=None, folder=None):
     """How to start the game with these arguments: (argv, working folder). Through Steam for a Steam copy
-    (it adds the player's own launch options), the game's own program for GOG and other copies."""
+    (it adds the player's own launch options), the game's own program for GOG and other copies; on macOS and Linux
+    the program that runs the game's data (game_program: OpenDE's), with the game folder as its working folder."""
     target = target or TARGET
     profile = TARGETS[target]
     folder = Path(folder or GAME)
     if from_steam(folder):
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Valve\Steam') as key:
-            steam = str(Path(winreg.QueryValueEx(key, 'SteamExe')[0]).resolve())
-        return [steam, '-applaunch', profile['app']] + list(args), None
+        steam = steam_program()
+        if steam:
+            return [steam, '-applaunch', profile['app']] + list(args), None
+    if not WINDOWS:
+        return [game_program()] + list(args), str(folder)
     system = system_folder(target, folder)
     return [str(system / profile['exe'])] + list(args), str(system)
 
@@ -318,7 +478,7 @@ EDITOR_CACHE = Path(__file__).resolve().parent / 'editor' / 'cache'
 GAME_CACHE = (APP_ROOT / 'tools' / 'mapkit' / 'editor' / 'cache' / ('game-' + TARGET)) if MANAGED_PROJECT else EDITOR_CACHE
 IS_REVISION = TARGET == 'revision'
 GAME_NAME = PROFILE['name']
-_default = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Deus Ex')
+_default = default_game()
 GAME = Path(CFG['game']) if CFG.get('game') else (_default if not check_game(_default, TARGET)
                                                  else (find_game(TARGET) or _default))
 # the targeted game's own folder: Revision\ for Revision, the Deus Ex folder itself for the original game
@@ -366,10 +526,24 @@ def mission_script(mission):
     return "Class'DeusEx.Mission%02d'" % mission if mission in _VANILLA_MISSIONS else 'None'
 
 
+def _running_names(names):
+    """Do programs of these names run? From ps's own list of process names (macOS, Linux): the whole name, case
+    aside, as tasklist's IMAGENAME filter matches it on Windows."""
+    try:
+        listing = subprocess.run(['ps', '-A', '-o', 'comm='], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    running = {Path(line.strip()).name.casefold() for line in listing.splitlines() if line.strip()}
+    return any(name.casefold() in running for name in names)
+
+
 def game_running(target=None):
     """Is the game (`target`'s, this process's by default; 'any': either) running on this PC? Its program by name, from
     any folder, as tasklist's IMAGENAME filter saw it, from one list of the processes (game_process: 15-20 ms; tasklist
-    took 0.3-0.5 s at the start of every Play's preparation and every Play, 30 Oct 2026)."""
+    took 0.3-0.5 s at the start of every Play's preparation and every Play, 30 Oct 2026). On macOS and Linux the game
+    is its data, run by OpenDE's own program (deusex), so that is what is looked for."""
+    if not WINDOWS:
+        return _running_names(['deusex'])
     import game_process
     names = [TARGETS[t]['exe'] for t in TARGETS] if target == 'any' else [TARGETS[target or TARGET]['exe']]
     return game_process.WindowsProcesses(GAME_EXE).named(names)
@@ -405,10 +579,62 @@ def current():
 
 def python():
     """The command that runs one of the editor's Python scripts: this Python, or (DeusEdix installed, a
-    frozen program: sys.executable is the program itself) its console twin, deusedix-cli.exe --run."""
+    frozen program: sys.executable is the program itself) its console twin, deusedix-cli.exe --run (deusedix-cli on
+    macOS and Linux)."""
     if getattr(sys, 'frozen', False):
-        return [str(Path(sys.executable).with_name('deusedix-cli.exe')), '--run']
+        return [str(Path(sys.executable).with_name('deusedix-cli.exe' if WINDOWS else 'deusedix-cli')), '--run']
     return [sys.executable]
+
+
+def documents_dir():
+    """The folder the user's documents are in: Documents of the user's home on Windows and macOS, Linux's
+    XDG_DOCUMENTS_DIR when it is set (its user-dirs.dirs; a translated folder name), else ~/Documents."""
+    if not WINDOWS and not MACOS:
+        given = os.environ.get('XDG_DOCUMENTS_DIR')
+        if not given:
+            try:
+                found = re.search(r'(?m)^\s*XDG_DOCUMENTS_DIR\s*=\s*"([^"]+)"',
+                                  (Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+                                   / 'user-dirs.dirs').read_text(encoding='utf-8', errors='replace'))
+            except OSError:
+                found = None
+            given = found.group(1).replace('$HOME', str(Path.home())) if found else ''
+        if given:
+            return Path(given).expanduser()
+    return Path.home() / 'Documents'
+
+
+def ffmpeg():
+    """The ffmpeg program the textures and the contact sheets are made with: the one on PATH, else where each system
+    keeps it (Windows' ffmpeg folder, Homebrew and MacPorts on macOS, /usr/bin and /usr/local/bin on Linux), else
+    PATH's own name again, so that the run that needs it says it is not installed."""
+    found = shutil.which('ffmpeg')
+    if found:
+        return found
+    if WINDOWS:
+        return r'C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe'
+    for name in ('/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/opt/local/bin/ffmpeg', '/usr/bin/ffmpeg'):
+        if Path(name).is_file():
+            return name
+    return 'ffmpeg'                     # PATH's own name: the run that needs it says it is not installed
+
+
+def label_font():
+    """The font ffmpeg's drawtext sets the catalogues' labels in, named as its filter syntax takes a file (Windows'
+    Arial, its ':' escaped; the systems' own sans serif on macOS and Linux). 'Arial' when none of them is there:
+    ffmpeg then asks fontconfig for a font by that name."""
+    if WINDOWS:
+        return r'C\:/Windows/Fonts/arial.ttf'
+    for name in ('/System/Library/Fonts/Supplemental/Arial.ttf',
+                 '/System/Library/Fonts/Supplemental/Verdana.ttf',
+                 '/Library/Fonts/Arial.ttf',
+                 '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+                 '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+                 '/usr/share/fonts/TTF/DejaVuSans.ttf',
+                 '/usr/share/fonts/dejavu/DejaVuSans.ttf'):
+        if Path(name).is_file():
+            return name
+    return 'Arial'
 
 
 if __name__ == '__main__':
@@ -416,3 +642,4 @@ if __name__ == '__main__':
     print('game', GAME, check_game(GAME, TARGET) or 'ok', '| games here:', games_in(GAME))
     print('found by Steam:', find_game(TARGET))
     print('libraries:', [str(x) for x in steam_libraries()])
+    print('data', DATA_DIR, '| platform data folder', data_dir(), '| default game', default_game())

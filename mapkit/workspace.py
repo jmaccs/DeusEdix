@@ -26,16 +26,41 @@ import settings  # noqa: E402
 import atomicfile  # noqa: E402
 
 PROJECT = settings.PROJECT
-DEV = PROJECT / 'DevInstall'
+WINDOWS = getattr(settings, 'WINDOWS', os.name == 'nt')
+# where the workspace and the compiled packages go: next to the code (the installer's layout), or the platform's own
+# folder for this user's data when the code's folder is not writable (settings.DATA_DIR)
+DATA = getattr(settings, 'DATA_DIR', PROJECT)
+SHARED = '.dll' if WINDOWS else ('.dylib' if sys.platform == 'darwin' else '.so')
+DEV = DATA / 'DevInstall'
 SYS = DEV / 'System'
-SRC = PROJECT / 'src' / settings.PACKAGE
-DIST = PROJECT / 'dist'
-MAPS = PROJECT / 'maps'
-HOST = PROJECT / 'tools' / 'mapkit' / 'bin' / 'UCMapKitHost.exe'
+SRC = DATA / 'src' / settings.PACKAGE
+DIST = DATA / 'dist'
+MAPS = DATA / 'maps'
+# The host and its engine bridge: where the build put them (settings.build_bin: the editor's own folder in the
+# install layout, build/host/bin in a checkout). A test's stand-in settings may not have it.
+BIN = getattr(settings, 'build_bin', lambda: PROJECT / 'tools' / 'mapkit' / 'bin')()
+HOST = BIN / ('UCMapKitHost.exe' if WINDOWS else 'UCMapKitHost')
+# The classes of the editor's own package, as the original game needs them: the ones that use what only Revision has,
+# in their version for the original game (dev\vanilla_runtime.py makes them; runtime\vanilla\Classes in a checkout,
+# project-template\vanilla\Classes in the installed folder).
+VANILLA = next((p for p in (PROJECT / 'tools' / 'mapkit' / 'project-template' / 'vanilla' / 'Classes',
+                           PROJECT / 'mapkit' / 'project-template' / 'vanilla' / 'Classes',
+                           PROJECT / 'runtime' / 'vanilla' / 'Classes') if p.is_dir()),
+                PROJECT / 'tools' / 'mapkit' / 'project-template' / 'vanilla' / 'Classes')
 STAMP = DEV / 'workspace.json'
-# DeusEdixNav (native/README.md): the walkable area's routes in C++, a package the editor's package uses
-NATIVE = tuple(HOST.with_name(n) for n in ('DeusEdixNav.u', 'DeusEdixNav.dll'))
-COMPILE_LOG = (PROJECT / 'logs' if settings.STANDALONE else DEV) / 'compile.log'    # logs\ is the installed program's
+# DeusEdixNav (native/README.md): the walkable area's routes in C++, a package the editor's package uses.
+#  - Windows: a prebuilt package and DeusEdixNav.dll, the library the GAME loads.
+#  - macOS/Linux: the DLL cannot exist (a 32-bit Windows PE), so there is no prebuilt file. The package is the
+#    editor's own script package, built with the editor's package from the source the editor ships, and its Route is
+#    OpenDE's own native (src/engine/nav_route.cc); nothing has to be installed into a game's System folder.
+# NAV_SOURCE is that source: a checkout keeps it in mapkit/native, an installed editor in src/DeusEdixNav beside its
+# own src/DeusEdix.
+NAV_LIBRARY = ('DeusEdixNav.dll',) if WINDOWS else ()
+NATIVE = tuple(HOST.with_name(n) for n in ('DeusEdixNav.u',) + NAV_LIBRARY) if WINDOWS else ()
+NAV_SOURCE = next((p for p in (DATA / 'src' / 'DeusEdixNav' / 'Classes',
+                               PROJECT / 'mapkit' / 'native' / 'DeusEdixNav' / 'Classes') if p.is_dir()),
+                  DATA / 'src' / 'DeusEdixNav' / 'Classes')
+COMPILE_LOG = (DATA / 'logs' if settings.STANDALONE else DEV) / 'compile.log'    # logs\ is the installed program's
 VERSION = 4               # 4: DeusEdixNav in the workspace, compiled before the editor's package
 # the retail packages the editor engine needs and Revision does not ship (setup.ps1)
 RETAIL = ('Editor', 'Fire', 'UBrowser', 'UWindow', 'MPCharacters', 'IpServer', 'Core')
@@ -52,7 +77,10 @@ def _log(log, *a):
 
 
 def _stamp():
-    st = settings.GAME_EXE.stat()
+    # the file that says which game the workspace was made from: its program on Windows (as it always was), its ini
+    # where the game is its data (macOS, Linux: there is no program of the game's own)
+    game_file = settings.GAME_EXE if settings.GAME_EXE.is_file() else settings.GAME_INI
+    st = game_file.stat()
     stamp = dict(version=VERSION, game=str(settings.GAME), revision=[st.st_size, int(st.st_mtime)], package=settings.PACKAGE)
     if not settings.IS_REVISION:            # Revision's stamp stays as it was (no rebuild of existing workspaces)
         stamp['target'] = settings.TARGET
@@ -70,9 +98,13 @@ def runtime_fingerprint():
     """Content, not timestamps: an installer may restore an older file date."""
     digest = hashlib.sha256()
     files = sorted((p for p in SRC.rglob('*') if p.is_file()), key=lambda p: str(p.relative_to(SRC)))
-    bridge = HOST.with_name('UCEngineBridge.dll')       # the host's engine bridge (host/README.md)
+    # The host's engine bridge, whichever it is: the game's own (Windows) or OpenDE's (macOS, Linux). The build
+    # changes the package, so the fingerprint has to change with it.
+    bridges = [f for f in (HOST.with_name('UCEngineBridge.dll'), HOST.with_name('UCOpenBridge' + SHARED),
+                           HOST.with_name('UCOpenBridge.so')) if f.is_file()]
     native = [f for f in NATIVE if f.is_file()]
-    for path in files + [HOST] + ([bridge] if bridge.is_file() else []) + native + [STAMP]:
+    nav = sorted(NAV_SOURCE.glob('*.uc')) if NAV_SOURCE.is_dir() else []     # the nav package's source (macOS, Linux)
+    for path in files + [HOST] + bridges + native + nav + [STAMP]:
         name = str(path.relative_to(SRC)) if path in files else path.name
         digest.update(name.encode('utf-8') + b'\0')
         digest.update(hashlib.sha256(path.read_bytes()).digest())
@@ -100,7 +132,12 @@ def _link_or_copy(src, dst):
 
 
 def _junction(link, target):
+    """A folder link in the workspace: a junction on Windows (no administrator rights for one), a symbolic link
+    elsewhere (macOS, Linux)."""
     if os.path.lexists(link):
+        return
+    if not WINDOWS:
+        os.symlink(str(target), str(link), target_is_directory=True)
         return
     import _winapi
     _winapi.CreateJunction(str(target), str(link))
@@ -154,6 +191,21 @@ def _compiler_sources():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
         files[rel] = digest
+    # The classes that use what only Revision has, in their version for the original game (dev\vanilla_runtime.py
+    # makes them; the project copies them the same way, projects.py). They replace the ones in the snapshot. A
+    # workspace whose sources use nothing of Revision's needs none of them.
+    if not getattr(settings, 'IS_REVISION', False) and VANILLA.is_dir():
+        for source in sorted(VANILLA.glob('*.uc')):
+            rel = 'Classes/' + source.name
+            if rel not in files:
+                raise ValueError('Unexpected class in the runtime for the original game: ' + source.name)
+            target = root / rel
+            content = source.read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            files[rel] = digest
     if not any(k.startswith('Classes/') and k.endswith('.uc') for k in files):
         raise ValueError('No runtime source classes found in ' + str(SRC))
     for rel, digest in owned.items():
@@ -174,8 +226,9 @@ def _compiler_sources():
 
 
 def _folder(line):
-    """The folder of a Paths= line, absolute and comparable (a relative one is the game's System's)."""
-    path = Path(line.strip()[6:])
+    """The folder of a Paths= line, absolute and comparable (a relative one is the game's System's). The ini files
+    write paths in the engine's own Windows form, whatever separators this system uses."""
+    path = Path(line.strip()[6:].strip().replace('\\', os.sep))
     if not path.is_absolute():
         path = settings.GAME_SYSTEM / path
     return os.path.normcase(os.path.normpath(str(path.parent)))
@@ -195,7 +248,8 @@ def _ini(text):
         # the folder the editor installs into holds the game's copies of its packages: the engine looks for a
         # package in every Paths folder whatever the line's extension, so even its *.dx line made the compiler
         # load the old DeusEdix.u from there instead of making the new one (0.1.37: 'Success', no package)
-        elif project_game.owned_path(line) and _folder(line) == _folder('Paths=%s\*.u' % settings.MAPS_DIR):
+        elif project_game.owned_path(line) and _folder(line) == _folder(
+                'Paths=' + os.path.join(str(settings.MAPS_DIR), '*.u')):
             continue
         if line.startswith('EditPackages='):
             continue
@@ -207,7 +261,7 @@ def _ini(text):
                 # Keep the private editor engine/packages ahead of the game copies.
                 out.append('Paths=%s\\*.u' % SYS)
             else:
-                path = Path(value)
+                path = Path(value.replace('\\', os.sep))
                 if not path.is_absolute():
                     path = settings.GAME_SYSTEM / path
                 out.append('Paths=' + os.path.normpath(str(path)))
@@ -218,7 +272,8 @@ def _ini(text):
         if line.strip() == '[Editor.EditorEngine]':
             names = [l[13:].strip() for l in lines if l.startswith('EditPackages=')]
             names = [n for n in names if n != settings.PACKAGE and (SYS / (n + '.u')).exists()]
-            native = ['DeusEdixNav'] if (SYS / 'DeusEdixNav.u').exists() else []     # loaded before the package using it
+            native = (['DeusEdixNav'] if (SYS / 'DeusEdixNav.u').exists() or (DEV / 'DeusEdixNav' / 'Classes').is_dir()
+                      else [])     # made first (or prebuilt on Windows): the editor's package uses it
             out += ['EditPackages=' + n for n in names + native + [settings.PACKAGE]]
     # the maps the user installed are looked for first, then the base game's music (make-ini.ps1)
     for i, line in enumerate(out):
@@ -253,7 +308,9 @@ def ensure(log=None, force=False):
         else:
             _link_or_copy(src, dst)
         count += 1
-    if settings.IS_REVISION:            # the original game's System has them already (linked above)
+    if getattr(settings, 'IS_REVISION', False) and (settings.GAME / 'System' / 'Editor.dll').is_file():
+        # the game's own editor engine and the retail packages the editor needs: only Windows has them (macOS and
+        # Linux run OpenDE's engine instead, and the game's data has none of these)
         atomicfile.copy_file(settings.GAME / 'System' / 'Editor.dll', SYS / 'Editor.dll')
         for name in RETAIL:
             f = settings.GAME / 'System' / (name + '.u')
@@ -269,6 +326,13 @@ def ensure(log=None, force=False):
         _compiler_sources()
     else:
         _junction(DEV / settings.PACKAGE, SRC)
+        # The classes that use what only Revision has, in their version for the original game: they replace the ones
+        # in the editor's own sources, which are Revision's (dev\vanilla_runtime.py makes them).
+        if not getattr(settings, 'IS_REVISION', False) and VANILLA.is_dir():
+            for file in VANILLA.glob('*.uc'):
+                target = SRC / 'Classes' / file.name
+                if target.is_file() and target.read_bytes() != file.read_bytes():
+                    shutil.copy2(file, target)
     _copy_native()
     ini = _ini(settings.GAME_INI.read_text(encoding='latin1'))
     for name in dict.fromkeys((settings.GAME_INI.name, 'DeusEx.ini', 'Default.ini')):
@@ -281,10 +345,37 @@ def ensure(log=None, force=False):
     return True
 
 
+def _native_files():
+    """The DeusEdixNav files this build has, in NATIVE's order: the package, then the library the port built (kit copies
+    them into a game's System folder; it wants one file per name it knows)."""
+    return [f for f in NATIVE if f.is_file()]
+
+
 def _copy_native():
-    """The newest DeusEdixNav.u and its DLL into the workspace's System: the compiler loads the package, and binds its
-    native function to the DLL, before the editor's package."""
-    for f in NATIVE:
+    """DeusEdixNav in the workspace before the editor's package. Windows: the newest prebuilt package and its DLL into
+    the workspace's System (the compiler binds its native functions to the DLL, as it always did). macOS/Linux: there
+    is no DLL; the package is the editor's own script package, so its source goes into the workspace, where the
+    compiler builds it with the editor's package, and a stale .u is dropped so it is made again."""
+    if not WINDOWS:
+        if not NAV_SOURCE.is_dir():
+            # No nav package's source here: the editor's package is built without it (the routes on a walkable area
+            # are the editor's own feature, not the game's).
+            return
+        target = DEV / 'DeusEdixNav' / 'Classes'
+        target.mkdir(parents=True, exist_ok=True)
+        wanted = {f.name for f in NAV_SOURCE.glob('*.uc')}
+        for f in target.glob('*.uc'):
+            if f.name not in wanted:
+                f.unlink()
+        for f in NAV_SOURCE.glob('*.uc'):
+            if not (target / f.name).is_file() or (target / f.name).read_bytes() != f.read_bytes():
+                shutil.copy2(f, target / f.name)
+        (SYS / 'DeusEdixNav.u').unlink(missing_ok=True)     # made with the editor's package; never shipped
+        return
+    library = [f for f in NATIVE[1:] if f.is_file()]
+    if not library:
+        raise FileNotFoundError('%s is missing: DeusEdix is not complete (reinstall it)' % NATIVE[1].name)
+    for f in [NATIVE[0]] + library:
         if not f.is_file():
             raise FileNotFoundError('%s is missing: DeusEdix is not complete (reinstall it)' % f.name)
         if not (SYS / f.name).is_file() or (SYS / f.name).read_bytes() != f.read_bytes():
@@ -313,15 +404,24 @@ def build(log=None):
             time.sleep(5)
         target.unlink(missing_ok=True)
         host = SYS / HOST.name
-        bridge = HOST.with_name('UCEngineBridge.dll')   # the host's engine bridge (host/README.md)
+        # the host's engine bridge, beside it in the build: the game's own engine on Windows (as it always was), or
+        # OpenDE's where that is what was built (macOS, Linux: host/README.md, kit.BRIDGES); a build without one runs
+        # the host alone, which then looks for its own (kit.host_files)
+        engine = HOST.with_name('UCEngineBridge.dll')
+        bridge = engine if engine.is_file() else HOST.with_name('UCOpenBridge' + SHARED)
         atomicfile.copy_file(HOST, host)
         if bridge.is_file():
             atomicfile.copy_file(bridge, SYS / bridge.name)
+        command = [str(host)]
+        if bridge.is_file() and bridge.name != engine.name:     # the host looks for the engine's own bridge by itself
+            command += ['--bridge', bridge.name]
+        # The host reads --bridge before its command (host/UCMapKitHost.cpp: the bridge is chosen when it starts).
+        command += ['--make', 'DeusEx.ini']
         t0 = time.time()
         try:
-            r = subprocess.run([str(host), '--make', 'DeusEx.ini'], cwd=str(SYS), capture_output=True, text=True,
+            r = subprocess.run(command, cwd=str(SYS), capture_output=True, text=True,
                                encoding='utf-8', errors='replace', timeout=1800, stdin=subprocess.DEVNULL,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
+                               creationflags=subprocess.CREATE_NO_WINDOW if WINDOWS else 0)
         finally:
             host.unlink(missing_ok=True)
             (SYS / bridge.name).unlink(missing_ok=True)
@@ -350,13 +450,15 @@ def build(log=None):
     # of its run, and Windows lets it be replaced, not written into (a Play after a Story change failed with [Errno 13]
     # for two minutes after a build: game test of 30 Oct 2026)
     atomicfile.copy_file(target, DIST / target.name)
+    if not WINDOWS and (SYS / 'DeusEdixNav.u').is_file():
+        atomicfile.copy_file(SYS / 'DeusEdixNav.u', DIST / 'DeusEdixNav.u')     # installed with the editor's package
     stamp = DIST / 'runtime-build.json'
     pending = stamp.with_suffix('.tmp')
     pending.write_text(json.dumps(dict(sources=fingerprint,
                                      package=hashlib.sha256((DIST / target.name).read_bytes()).hexdigest())),
                        encoding='utf-8')
     pending.replace(stamp)
-    say('OK: dist\\%s' % target.name)
+    say('OK: %s' % os.path.join('dist', target.name))
     return True, lines
 
 
@@ -419,10 +521,18 @@ def install(log=None, *, maps=True, activate_project=True):
             say('installed %s' % f.name)
     if not (dest / (settings.PACKAGE + '.u')).is_file():
         return False, lines + ['%s.u is not built yet' % settings.PACKAGE]
-    # DeusEdixNav, the package the editor's package uses: its DLL works only in the game's own System folder
+    # DeusEdixNav, the package the editor's package uses. Windows: its DLL works only in the game's own System folder.
+    # macOS/Linux: no DLL; the package is OpenDE's own script package and goes next to the editor's own, in the maps
+    # folder the game reads.
     import kit
-    for name in kit.install_native(settings.GAME_SYSTEM, NATIVE):
-        say('installed %s in %s' % (name, settings.GAME_SYSTEM))
+    if WINDOWS:
+        for name in kit.install_native(settings.GAME_SYSTEM, _native_files()):
+            say('installed %s in %s' % (name, settings.GAME_SYSTEM))
+    else:
+        nav = DIST / 'DeusEdixNav.u'
+        if nav.is_file():
+            shutil.copy2(nav, dest / nav.name)
+            say('installed %s' % nav.name)
     # other mods' packages kept with the project (Packages panel, Import a mod): the game finds them next to the maps
     import kit
     for p in kit.extra_packages():
@@ -448,15 +558,22 @@ def uninstall(log=None):
     return project_game.deactivate()
 
 
+def _game_there(target):
+    """Is that game in the game folder? Its program on Windows (what this always looked for), its data on macOS and
+    Linux, where the game has no program of its own (settings.game_installed)."""
+    installed = getattr(settings, 'game_installed', None)
+    if installed is not None:
+        return installed(settings.GAME, target)
+    profile = settings.TARGETS[target]              # a test's stand-in settings: its program, or what it says is missing
+    if (settings.system_folder(target) / profile['exe']).is_file():
+        return True
+    return bool(getattr(settings, 'check_game', None)) and not settings.check_game(settings.GAME, target)
+
+
 def game_systems():
     """The System folders, with their program, of the games in the Deus Ex folder: the original game's, and
     Revision's when it is there."""
-    found = []
-    for target, profile in settings.TARGETS.items():
-        system = settings.system_folder(target)
-        if (system / profile['exe']).is_file():
-            found.append(system)
-    return found
+    return [settings.system_folder(target) for target in settings.TARGETS if _game_there(target)]
 
 
 def install_native_everywhere(log=None):
@@ -468,7 +585,7 @@ def install_native_everywhere(log=None):
     ok = True
     for system in game_systems():
         try:
-            written = kit.install_native(system, NATIVE)
+            written = kit.install_native(system, _native_files())
             say('DeusEdixNav %s in %s' % ('installed' if written else 'already there', system))
         except OSError as e:                    # a running game holds its DLL: the next Install or Play puts it there
             say('DeusEdixNav not installed in %s: %s' % (system, e))
@@ -557,7 +674,7 @@ def remove_game_files(log=None):
     for target, profile in settings.TARGETS.items():
         system = settings.system_folder(target)
         root = system.parent
-        if not (system / profile['exe']).is_file():
+        if not _game_there(target):
             continue
         if settings.game_running(target):
             say('%s is running: what DeusEdix put into it was left there' % profile['short'])
@@ -589,7 +706,7 @@ def remove_game_files(log=None):
 def _is_link(path):
     """A junction or a symbolic link (a reparse point): removing it removes the link, never what it points to."""
     try:
-        return bool(os.lstat(path).st_file_attributes & 0x400)      # FILE_ATTRIBUTE_REPARSE_POINT
+        return os.path.islink(path) or bool(os.lstat(path).st_file_attributes & 0x400)    # FILE_ATTRIBUTE_REPARSE_POINT
     except (OSError, AttributeError):
         return False
 
@@ -615,8 +732,11 @@ def remove_workspace(log=None):
     """Delete the workspace and the caches made from the game (the uninstaller asks for it). The user's
     own work stays: maps, stories, characters, models, textures. The workspace's files are hard links
     or copies of Revision's: deleting them leaves the game's own files as they are."""
-    kit = PROJECT / 'tools' / 'mapkit'
-    for folder in (DEV, kit / 'runs', kit / 'out', kit / 'editor' / 'cache', kit / 'catalog'):     # catalog: the texture sizes read from the game
+    caches = [DEV]
+    for base in dict.fromkeys((PROJECT, DATA)):         # the same folder unless the code's is not writable
+        kit = Path(base) / 'tools' / 'mapkit'
+        caches += [kit / 'runs', kit / 'out', kit / 'editor' / 'cache', kit / 'catalog']     # catalog: the texture sizes read from the game
+    for folder in caches:
         if folder.is_dir() and not _is_link(folder):
             _rmtree(folder)
             _log(log, 'removed', folder)

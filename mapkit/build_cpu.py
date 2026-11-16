@@ -3,6 +3,9 @@
 Use Windows CPU Sets (soft placement), never realtime priority, hard affinity or
 machine power settings. Existing CPU-set assignments and affinity limits win.
 Unsupported APIs/topologies simply keep the normal Windows scheduling policy.
+
+macOS and Linux have no CPU Sets and none of this machine's policy is changed there: a child started from
+background() is only nicened, and a dedicated build keeps the system's own scheduling.
 """
 import os
 import struct
@@ -26,6 +29,19 @@ def background():
         _local.background = was
 
 
+def _lower(pid):
+    """POSIX' one lever for "the person's programs come first": nice a child a little below this program.
+    CPU Sets do not exist there, and lowering a dedicated build would only make it slower."""
+    setpriority = getattr(os, 'setpriority', None)
+    if setpriority is None or pid is None:
+        return
+    try:
+        current = os.getpriority(os.PRIO_PROCESS, int(pid))
+        os.setpriority(os.PRIO_PROCESS, int(pid), max(current, os.nice(0)) + 5)
+    except (AttributeError, OSError, ValueError, TypeError):
+        pass
+
+
 def _in_background(process_handle):
     """In background(): the process below normal priority, and True (no fast cores asked for it)"""
     if not getattr(_local, 'background', False):
@@ -40,6 +56,8 @@ def _in_background(process_handle):
             k.SetPriorityClass(w.HANDLE(process_handle), 0x4000)      # BELOW_NORMAL_PRIORITY_CLASS
         except (AttributeError, OSError, ValueError, TypeError):
             pass
+    elif os.name != 'nt':
+        _lower(process_handle)
     return True
 
 
@@ -107,6 +125,7 @@ def prefer_performance(process_handle=None):
     With no handle, affect this disposable build worker only. The editor server
     calls this with its child handle, so the server/UI scheduling is unchanged.
     Returns the selected CPU-set IDs, or [] when Windows retains its defaults.
+    On macOS and Linux there are no CPU sets: nothing is changed, and [] is returned.
     """
     if _in_background(process_handle):
         return []

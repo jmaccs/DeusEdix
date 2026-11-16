@@ -6,15 +6,18 @@ balcony rails. Meant for Unlit surfaces: the texture is the light.
 Colour quantisation to 256 colours goes through ffmpeg (palettegen/paletteuse).
 """
 import random
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 from functools import wraps
 import inspect
 import texture_cache
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import settings  # noqa: E402
+
 OUT = Path(__file__).resolve().parent / 'gen'
-FF = shutil.which('ffmpeg') or r'C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe'
+FF = settings.ffmpeg()
 
 
 def _cached_texture(function):

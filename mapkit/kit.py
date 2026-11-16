@@ -1,8 +1,8 @@
-"""mapkit: private runs of the headless SDK editor (tools\\mapkit\\bin\\UCMapKitHost.exe).
+"""mapkit: private runs of the headless SDK editor (tools/mapkit/bin/UCMapKitHost).
 
-Each run lives in tools\\mapkit\\runs\\<id> with its own System folder (hard links to the
-DevInstall SDK files, the compiled mod from dist\\, adapted ini files), Input\\ and Output\\.
-Nothing in the game folder or in maps\\ is written here.
+Each run lives in tools/mapkit/runs/<id> with its own System folder (hard links to the
+DevInstall SDK files, the compiled mod from dist/, adapted ini files), Input/ and Output/.
+Nothing in the game folder or in maps/ is written here.
 """
 import array
 import json
@@ -19,10 +19,86 @@ from contextlib import contextmanager, nullcontext
 import atomicfile
 import settings
 
-PROJECT = Path(__file__).resolve().parents[2]
-DEV = PROJECT / 'DevInstall' / 'System'
-RUNS = PROJECT / 'tools' / 'mapkit' / 'runs'
-HOST = PROJECT / 'tools' / 'mapkit' / 'bin' / 'UCMapKitHost.exe'
+# The editor's own folder, the same one settings.PROJECT names: the install layout (the code in tools/mapkit, the
+# folder its parent) or a checkout with mapkit/ at the top (the folder mapkit's parent). settings knows both, so the
+# two never disagree about where the editor's files are.
+PROJECT = settings.PROJECT
+# Where the workspace and the runs live: the editor's own folder, or the platform's own folder for this user's data
+# when the code's folder is not one they write in (settings.DATA_DIR; workspace.py uses the same one).
+DATA = getattr(settings, 'DATA_DIR', PROJECT)
+DEV = DATA / 'DevInstall' / 'System'
+RUNS = DATA / 'tools' / 'mapkit' / 'runs'
+# Where the host and its bridge are built: the editor's own folder in the install layout, or build/host/bin in a
+# checkout (settings.build_bin tells the two apart by where the editor's own code is). A test's stand-in settings
+# may not have it.
+BIN = getattr(settings, 'build_bin', lambda: PROJECT / 'tools' / 'mapkit' / 'bin')()
+# The host's name in the build folder: a console program on Windows, a plain binary on macOS and Linux. A macOS
+# build may make a UCMapKitHost.app bundle instead of the plain binary; host_executable() finds the program to run
+# in either.
+HOST = BIN / ('UCMapKitHost.exe' if os.name == 'nt' else 'UCMapKitHost')
+
+# An engine bridge is a shared library beside the host (host/bridge.h, host/README.md): OpenDE's own bridge
+# (host/openbridge) when it was built, else the game's own editor engine, which only exists on Windows. The host
+# loads the first of BRIDGES it finds; any other one is named with --bridge (host_command).
+SHARED = '.dll' if os.name == 'nt' else ('.dylib' if sys.platform == 'darwin' else '.so')
+OPEN_BRIDGE = 'UCOpenBridge' + SHARED
+ENGINE_BRIDGE = 'UCEngineBridge' + SHARED       # the one the host looks for by itself (platform.h, UC_BRIDGE_FILE)
+BRIDGES = (OPEN_BRIDGE, ENGINE_BRIDGE)
+
+
+def host_location(host=None):
+    """Where the host is: HOST, or the UCMapKitHost.app bundle built in its place on macOS. A plain binary is the
+    normal case; the bundle only when that is what the build made."""
+    host = Path(HOST if host is None else host)
+    if host.exists():
+        return host
+    bundle = host.with_name(host.name + '.app')
+    return bundle if bundle.is_dir() else host
+
+
+def host_executable(host=None):
+    """The program to run: the host itself, or the one inside a UCMapKitHost.app bundle
+    (Contents/MacOS/UCMapKitHost)."""
+    host = host_location(host)
+    return host / 'Contents' / 'MacOS' / host.stem if host.suffix.lower() == '.app' else host
+
+
+def host_exists(host=None):
+    """Whether the host was built: the plain binary, or the macOS bundle made in its place."""
+    return host_executable(host).is_file()
+
+
+def host_bridge(folder=None):
+    """The engine bridge in a folder (the build's bin, or a run's System): OpenDE's own when it is there, else the
+    game's own. None when neither is: the host then looks for its default one itself (an older build runs alone)."""
+    folder = Path(HOST.parent if folder is None else folder)
+    for name in BRIDGES:
+        path = folder / name
+        if path.is_file():
+            return path
+    return None
+
+
+def host_command(folder, *arguments):
+    """The command line that starts a run's host: the program, then --bridge unless the bridge there is the one the
+    host looks for by itself, then the arguments. A POSIX command line is an argument list, so no quoting."""
+    system = Path(folder) / 'System'
+    command = [str(system / host_executable().name)]
+    bridge = host_bridge(system)
+    if bridge is not None and bridge.name != ENGINE_BRIDGE:
+        command += ['--bridge', bridge.name]        # beside the host: cwd is System
+    return command + [str(argument) for argument in arguments]
+
+
+def hidden_window():
+    """Popen's keyword that keeps the host's console window off the screen: only Windows has one to hide (macOS and
+    Linux start it in the terminal's session, as any program)."""
+    return {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+
+
+def process_id(process):
+    """A process's id for build_cpu: Windows' own handle (Popen's private _handle), else the pid."""
+    return int(process._handle) if os.name == 'nt' else process.pid
 
 # the engine's and the game's packages every editor session loads (with Revision: Revision.u too)
 EDIT_PACKAGES = ('Core', 'Engine', 'Editor', 'Extension', 'DeusExUI', 'ConSys', 'DeusEx') + settings.GAME_EDIT_PACKAGES
@@ -163,12 +239,22 @@ def prune(keep=20):
 
 def host_files():
     """The host, its engine bridge and the bridge's settings next to it (host/README.md); a host without them (an
-    older build) runs alone, a bridge without its settings with its defaults."""
-    extra = [HOST.with_name(n) for n in ('UCEngineBridge.dll', 'UCEngineBridge.ini')]
-    return [HOST] + [f for f in extra if f.is_file()]
+    older build) runs alone, a bridge without its settings with its defaults. The bridge's settings belong to the
+    game's own bridge (UCEngineBridge.ini); OpenDE's bridge takes its defaults from the build."""
+    files = [host_executable()]
+    bridge = host_bridge(files[0].parent)
+    if bridge is not None:
+        files.append(bridge)
+        settings_file = bridge.with_suffix('.ini')
+        if bridge.name == ENGINE_BRIDGE and settings_file.is_file():
+            files.append(settings_file)
+    return files
 
 
-NATIVE = ('DeusEdixNav.u', 'DeusEdixNav.dll')      # the walkable area's routes in C++ (native/README.md)
+# DeusEdixNav (native/README.md): the walkable area's routes. Windows: the package and the DLL the GAME loads. macOS
+# and Linux: no DLL can exist for the game there (it is a 32-bit Windows PE), OpenDE answers the package's native
+# itself, and the package is the editor's own script package: there is nothing to install into a game's System folder.
+NATIVE = ('DeusEdixNav.u', 'DeusEdixNav.dll') if getattr(settings, 'WINDOWS', os.name == 'nt') else ('DeusEdixNav.u',)
 
 
 def native_files():
@@ -180,9 +266,12 @@ def native_files():
 def install_native(system, files=None):
     """DeusEdixNav.u and DeusEdixNav.dll (files: these paths instead of native_files()) into a game's System folder,
     the one with its program: the engine looks for a package's DLL there and nowhere else. Always DeusEdix's own
-    build: a mod file never carries a DLL. -> the names written."""
+    build: a mod file never carries a DLL. On macOS and Linux there is no DLL: only the package is looked for, and
+    nothing fails when no file is there. -> the names written."""
     files = [Path(f) for f in files if Path(f).is_file()] if files is not None else native_files()
-    if len(files) != len(NATIVE):
+    windows = getattr(settings, 'WINDOWS', os.name == 'nt')
+    have = {f.name for f in files}
+    if windows and any(n not in have for n in NATIVE):
         raise FileNotFoundError('DeusEdixNav is not built: tools\\mapkit\\native\\build_native.ps1, build_package.py')
     written = []
     for f in files:
@@ -209,8 +298,9 @@ def editor_packages():
 
 def new_run(inputs=(), label='run'):
     """Create a private run. inputs: paths of maps (or other files) copied into Input\\."""
-    if not HOST.exists():
-        raise SystemExit('Build the host first: tools\\mapkit\\host\\build_host.ps1')
+    if not host_exists():
+        raise SystemExit('Build the host first: mapkit/host/build_host.ps1 (Windows) or the c++ command in '
+                         'mapkit/host/README.md (macOS, Linux)')
     prune()
     folder = RUNS / (time.strftime('%Y%m%d-%H%M%S-') + label + '-' + uuid.uuid4().hex[:6])
     system = folder / 'System'
@@ -291,12 +381,11 @@ def _execute(folder, commands, log_name, timeout, echo, watch=None, prepared=Non
         prepared = None
     with (nullcontext(prepared.stream) if prepared is not None else log.open('wb')) as stream:
         process = prepared.process if prepared is not None else subprocess.Popen(
-            [str(folder / 'System' / HOST.name), str(command_file)], cwd=folder / 'System',
-            stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            host_command(folder, command_file), cwd=folder / 'System',
+            stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT, **hidden_window())
         try:
             import build_cpu
-            build_cpu.prefer_performance(int(process._handle))
+            build_cpu.prefer_performance(process_id(process))
             if watch is not None:
                 watch.started(process, log)
             if prepared is not None:
@@ -326,11 +415,10 @@ class _PreparedBuild:
         self.sent = False
         try:
             self.process = subprocess.Popen(
-                [str(self.folder / 'System' / HOST.name), '--wait-batch'], cwd=self.folder / 'System',
-                stdin=subprocess.PIPE, stdout=self.stream, stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW)
+                host_command(self.folder, '--wait-batch'), cwd=self.folder / 'System',
+                stdin=subprocess.PIPE, stdout=self.stream, stderr=subprocess.STDOUT, **hidden_window())
             import build_cpu
-            build_cpu.prefer_performance(int(self.process._handle))
+            build_cpu.prefer_performance(process_id(self.process))
         except BaseException:
             if hasattr(self, 'process'):
                 self.close()
@@ -375,7 +463,7 @@ def prewarm_build(label):
         yield resident_build.RemoteBuild(label)
         return
     try:
-        supported = os.environ.get('DEUSEDIX_BUILD_PREWARM', 'auto') != 'off' and b'--wait-batch\0' in HOST.read_bytes()
+        supported = os.environ.get('DEUSEDIX_BUILD_PREWARM', 'auto') != 'off' and b'--wait-batch\0' in host_executable().read_bytes()
     except OSError:
         supported = False
     try:
@@ -388,7 +476,7 @@ def prewarm_build(label):
 
 
 class Session:
-    """A live host: the SDK editor stays open with its level, commands go one at a time.
+    r"""A live host: the SDK editor stays open with its level, commands go one at a time.
 
         s = Session([map_path], 'label'); s.cmd('MAP LOAD FILE="..\Input\X.dx"'); s.trace(...); s.close()
 
@@ -401,11 +489,11 @@ class Session:
         import threading
         self.folder = Path(folder) if folder else new_run(inputs, label)
         self.log = (self.folder / 'session.log').open('a', encoding='utf-8')
-        self.proc = subprocess.Popen([str(self.folder / 'System' / HOST.name), '-'], cwd=self.folder / 'System',
+        self.proc = subprocess.Popen(host_command(self.folder, '-'), cwd=self.folder / 'System',
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     creationflags=subprocess.CREATE_NO_WINDOW)
+                                     **hidden_window())
         import build_cpu
-        build_cpu.prefer_performance(int(self.proc._handle))
+        build_cpu.prefer_performance(process_id(self.proc))
         self.lines = queue.Queue()
 
         def pump():

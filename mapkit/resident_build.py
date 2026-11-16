@@ -14,6 +14,7 @@ import queue
 import re
 import secrets
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -27,13 +28,17 @@ LIMIT = 1024 * 1024
 
 def supported():
     import kit
-    if os.name != 'nt' or os.environ.get('DEUSEDIX_BUILD_RESIDENT', 'auto') == 'off':
+    if os.environ.get('DEUSEDIX_BUILD_RESIDENT', 'auto') == 'off':
         return False
     try:
-        if b'--build-worker\0' not in Path(kit.HOST).read_bytes():
+        host = Path(kit.host_executable())
+        if b'--build-worker\0' not in host.read_bytes():
             return False
-        if b'UC_BUILD_INIT\0' not in Path(kit.HOST).with_name('UCEngineBridge.dll').read_bytes():
+        bridge = kit.host_bridge(host.parent)
+        if bridge is None or b'UC_BUILD_INIT\0' not in bridge.read_bytes():
             return False
+        if bridge.name != kit.ENGINE_BRIDGE:
+            return True         # the OpenDE bridge: nothing of the game's own engine to pin to a known build
         core = hashlib.sha256((Path(kit.DEV) / 'Core.dll').read_bytes()).hexdigest()
         editor = hashlib.sha256((Path(kit.DEV) / 'Editor.dll').read_bytes()).hexdigest()
         return core in {'c640fd28fcfe84ac616a37eccd248d665e4008b9554bb87f6437385248c42417',
@@ -66,7 +71,7 @@ def eligible(commands):
             return False
         # Loading a saved result is supported. Loading arbitrary input maps into
         # this pool, animation authoring and external package mutations are not.
-        if line.startswith('MAP LOAD ') and not re.fullmatch(r'MAP LOAD FILE="\.\.\\Output\\[\w-]+\.dx"', line):
+        if line.startswith('MAP LOAD ') and not re.fullmatch(r'MAP LOAD FILE="\.\.[\\/]Output[\\/][\w-]+\.dx"', line):
             return False
     return True
 
@@ -94,25 +99,42 @@ def fingerprint(env, commands):
     return json.dumps([str(Path(kit.PROJECT).resolve()), ini, files, binaries, modes], sort_keys=True)
 
 
+def _hold(stream):
+    """Hold a run against pruning (run_in_use): a byte range of the lease file on Windows, its flock elsewhere."""
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 def run_in_use(folder):
     """The originating run contains loaded packages: pruning must leave it intact."""
     path = Path(folder) / '.resident.lock'
-    if os.name != 'nt' or not path.exists():
+    if not path.exists():
         return False
-    import msvcrt
     try:
         with path.open('r+b') as stream:
             try:
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                _hold(stream)
             except OSError:
                 return True
-            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
     except OSError:
         return True
     return False
 
 
 def private_bytes(process):
+    """A process's private memory; None when the system cannot tell (the pool then retires it: never overcommitted)."""
+    if os.name != 'nt':
+        return None             # no portable per-process private bytes: macOS and Linux reuse is bounded by the timeout
     import ctypes
     from ctypes import wintypes
     class Counters(ctypes.Structure):
@@ -127,6 +149,12 @@ def private_bytes(process):
 
 
 def memory_available():
+    if os.name != 'nt':
+        try:
+            pages, size = os.sysconf('SC_AVPHYS_PAGES'), os.sysconf('SC_PAGE_SIZE')
+            return pages * size if pages > 0 and size > 0 else 0
+        except (AttributeError, OSError, ValueError):
+            return 0
     import ctypes
     from ctypes import wintypes
     class Status(ctypes.Structure):
@@ -166,15 +194,14 @@ class Pool:
     def _start(self, folder, env):
         import kit
         import build_cpu
-        import msvcrt
         self.lease = (folder / '.resident.lock').open('w+b')
         self.lease.write(b'1'); self.lease.flush(); self.lease.seek(0)
-        msvcrt.locking(self.lease.fileno(), msvcrt.LK_NBLCK, 1)
+        _hold(self.lease)
         self.lines = queue.Queue()
-        self.process = subprocess.Popen([str(folder / 'System' / kit.HOST.name), '--build-worker'],
+        self.process = subprocess.Popen(kit.host_command(folder, '--build-worker'),
             cwd=folder / 'System', stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW, env=env)
-        build_cpu.prefer_performance(int(self.process._handle))
+            stderr=subprocess.STDOUT, env=env, **kit.hidden_window())
+        build_cpu.prefer_performance(kit.process_id(self.process))
         lines, stream = self.lines, self.process.stdout
         def pump():
             try:
@@ -284,8 +311,11 @@ class Offer:
         from multiprocessing.connection import Listener
         self.env, self.watch = dict(env), watch
         self.secret = secrets.token_hex(32)
-        self.address = r'\\.\pipe\deusedix-build-' + secrets.token_hex(24)
-        self.listener = Listener(self.address, family='AF_PIPE')
+        # a private pipe: a named pipe on Windows, a socket file of the user's own temp folder elsewhere
+        self.family = 'AF_PIPE' if os.name == 'nt' else 'AF_UNIX'
+        self.address = (r'\\.\pipe\deusedix-build-' + secrets.token_hex(24) if os.name == 'nt' else
+                        str(Path(tempfile.mkdtemp(prefix='deusedix-build-')) / 'worker'))
+        self.listener = Listener(self.address, family=self.family)
         self.closed = threading.Event(); self.attached = threading.Event()
         self.worker = None
         env[ENDPOINT] = json.dumps([self.address, self.secret])
@@ -339,11 +369,14 @@ class Offer:
         if self.thread.is_alive():
             from multiprocessing.connection import Client
             try:
-                with Client(self.address, family='AF_PIPE') as connection:
+                with Client(self.address, family=self.family) as connection:
                     connection.send_bytes(json.dumps(dict(secret=self.secret, close=True)).encode())
             except (OSError, EOFError):
                 pass
         self.listener.close()
+        if self.family != 'AF_PIPE':                    # the socket's own folder, made for it (Offer)
+            import shutil
+            shutil.rmtree(Path(self.address).parent, ignore_errors=True)
         self.thread.join(timeout=2)
 
 
@@ -375,7 +408,7 @@ def execute_remote(folder, batch, timeout, endpoint):
     from multiprocessing.connection import Client
     import kit
     address, secret = json.loads(endpoint)
-    with Client(address, family='AF_PIPE') as connection:
+    with Client(address, family='AF_PIPE' if os.name == 'nt' else 'AF_UNIX') as connection:
         connection.send_bytes(json.dumps(dict(secret=secret, folder=str(folder.resolve()),
             batch=str(batch.resolve()), timeout=timeout)).encode())
         if not connection.poll(timeout + 10):

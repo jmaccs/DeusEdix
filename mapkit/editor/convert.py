@@ -155,8 +155,10 @@ def _run(game, target, label, extra_paths=(), packages=()):
         for f in packages:
             (system / Path(f).name).unlink(missing_ok=True)
             _link(Path(f), system / Path(f).name)
-        for f in (HOST, HOST.with_name('UCEngineBridge.dll')) + tuple(HOST.with_name(n) for n in ('DeusEdixNav.u', 'DeusEdixNav.dll')):
-            if f.is_file():             # the host, its engine bridge, DeusEdixNav (the editor's package uses it)
+        # The host, its engine bridge (the game's own on Windows, OpenDE's elsewhere) and the nav package (the
+        # editor's package uses it): the run's System folder, where the host looks for the bridge beside itself.
+        for f in (HOST, *kit.host_files()[1:], *kit.native_files()):
+            if f.is_file():
                 (system / f.name).unlink(missing_ok=True)
                 shutil.copy2(f, system / f.name)
         # the System is mostly hard links to the game's files: a write replaces a name, never writes into one
