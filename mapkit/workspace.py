@@ -283,12 +283,33 @@ def _ini(text):
     return '\r\n'.join(out) + '\r\n'
 
 
+def _apply_vanilla_overlay():
+    """The classes that use what only Revision has, in their version for the original game: they replace the ones
+    in the editor's own sources, which are Revision's (dev\\vanilla_runtime.py makes them). The editor's sources
+    are read-only, so the versions are laid over them in the workspace's own copy.
+
+    Done before the workspace is made and again when it is refreshed: a workspace made while the editor's sources
+    were Revision's would keep them."""
+    if getattr(settings, 'IS_REVISION', False) or not VANILLA.is_dir():
+        return
+    target_root = SRC / 'Classes'
+    if not target_root.is_dir():
+        return
+    for file in VANILLA.glob('*.uc'):
+        target = target_root / file.name
+        if not target.is_file():
+            continue
+        if target.read_bytes() != file.read_bytes():
+            shutil.copy2(file, target)
+
+
 def ensure(log=None, force=False):
     """Make or refresh the workspace. True when it is ready."""
     missing = settings.check_game(settings.GAME, settings.TARGET)
     if missing:
         _log(log, 'Game folder %s: missing %s' % (settings.GAME, ', '.join(missing)))
         return False
+    _apply_vanilla_overlay()
     if ready() and not force:
         return True
     rev_sys = settings.GAME_SYSTEM
@@ -326,13 +347,6 @@ def ensure(log=None, force=False):
         _compiler_sources()
     else:
         _junction(DEV / settings.PACKAGE, SRC)
-        # The classes that use what only Revision has, in their version for the original game: they replace the ones
-        # in the editor's own sources, which are Revision's (dev\vanilla_runtime.py makes them).
-        if not getattr(settings, 'IS_REVISION', False) and VANILLA.is_dir():
-            for file in VANILLA.glob('*.uc'):
-                target = SRC / 'Classes' / file.name
-                if target.is_file() and target.read_bytes() != file.read_bytes():
-                    shutil.copy2(file, target)
     _copy_native()
     ini = _ini(settings.GAME_INI.read_text(encoding='latin1'))
     for name in dict.fromkeys((settings.GAME_INI.name, 'DeusEx.ini', 'Default.ini')):
