@@ -3218,13 +3218,33 @@ static bool newMap(const std::string& name)
     return true;
 }
 
+// A file the command names. The editor's command lines are written in the engine's own Windows form
+// ("..\\Input\\map.dx"), so the separators are the ones file names use on every platform, and a relative path is
+// taken from where the host runs: the run's System folder (so "..\\Input" is the run's Input folder, as on
+// Windows, where the host runs there too).
+static std::filesystem::path resolveFile(const std::string& file)
+{
+    std::string text = file;
+    std::replace(text.begin(), text.end(), '\\', '/');
+    std::filesystem::path path(text);
+    if (path.is_absolute()) {
+        return path;
+    }
+    std::error_code error;
+    std::filesystem::path cwd = std::filesystem::current_path(error);
+    if (error) {
+        return path;
+    }
+    return cwd / path;
+}
+
 // MAP LOAD FILE=...: a map from its path, or from the game's Maps folder by name.
 static bool loadMap(const std::string& file)
 {
     if (file.empty()) {
         return false;
     }
-    std::filesystem::path path(file);
+    std::filesystem::path path = resolveFile(file);
     std::string name = path.stem().string();
     dx::Linker* linker = nullptr;
     if (std::filesystem::is_regular_file(path)) {
@@ -3262,7 +3282,7 @@ static bool saveMap(const std::string& file)
         return false;
     }
     std::string error;
-    bool ok = dx::mapwriter::saveMap(Level, std::filesystem::path(file), &error);
+    bool ok = dx::mapwriter::saveMap(Level, resolveFile(file), &error);
     if (!ok) {
         say("UCMapKit|failed|MAP SAVE|%s", error.c_str());
     }
@@ -3307,7 +3327,7 @@ static bool exportMap(const std::string& file)
         }
         filtered += line;
     }
-    std::ofstream out(file, std::ios::binary);
+    std::ofstream out(resolveFile(file), std::ios::binary);
     if (!out) {
         return false;
     }
@@ -3421,7 +3441,7 @@ static void nameImportedActors(const std::vector<dx::UObject*>& created, std::st
 // MAP IMPORT FILE=... (the map's own actors) and MAP IMPORTADD FILE=... (added to the map)
 static bool importMap(const std::string& file, bool replace)
 {
-    std::ifstream in(file, std::ios::binary);
+    std::ifstream in(resolveFile(file), std::ios::binary);
     if (!in) {
         say("UCMapKit|failed|MAP IMPORT|cannot read %s", file.c_str());
         return false;
@@ -3487,7 +3507,7 @@ static bool importBrushCommand(const std::string& file)
     if (!model || !model->polys) {
         return false;
     }
-    std::ifstream in(file, std::ios::binary);
+    std::ifstream in(resolveFile(file), std::ios::binary);
     if (!in) {
         return false;
     }
@@ -3566,7 +3586,7 @@ static bool objLoad(const std::string& file)
     std::string name = std::filesystem::path(file).stem().string();
     dx::Linker* linker = nullptr;
     std::error_code error;
-    std::filesystem::path path(file);
+    std::filesystem::path path = resolveFile(file);
     if (std::filesystem::is_regular_file(path, error)) {
         dx::objects::setPackageFile(dx::Name(name), path);
         linker = dx::objects::loadPackageFile(dx::Name(name), path, false);
@@ -3736,10 +3756,11 @@ static int exec(const char* line)
         std::string package = words.value("PACKAGE");
         dx::UObject* outer = package.empty() ? (Level ? Level->outermost() : sessionPackage("MyLevel")) : sessionPackage(package.c_str());
         std::filesystem::path directory = std::filesystem::current_path();
-        // a file's directory first (the editor's paths are relative to the run's System)
+        // a file's directory first (the editor's paths are relative to the run's System, and are written in the
+        // engine's own Windows form)
         std::string file = words.value("FILE");
         if (!file.empty()) {
-            std::filesystem::path candidate(file);
+            std::filesystem::path candidate = resolveFile(file);
             if (candidate.has_parent_path() && std::filesystem::is_directory(candidate.parent_path())) {
                 directory = candidate.parent_path();
             }
